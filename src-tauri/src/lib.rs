@@ -96,31 +96,85 @@ fn build_console_filter() -> env_filter::Filter {
     builder.build()
 }
 
-fn show_main_window(app: &AppHandle) {
-    if let Some(main_window) = app.get_webview_window("main") {
-        if let Err(e) = main_window.unminimize() {
-            log::error!("Failed to unminimize webview window: {}", e);
-        }
-        if let Err(e) = main_window.show() {
-            log::error!("Failed to show webview window: {}", e);
-        }
-        if let Err(e) = main_window.set_focus() {
-            log::error!("Failed to focus webview window: {}", e);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
-                log::error!("Failed to set activation policy to Regular: {}", e);
-            }
-        }
-        return;
+/// Builds the hidden settings window. Closing it destroys it rather than hiding
+/// it, so its webview process does not stay resident while Handy sits in the
+/// tray; `show_main_window` calls this again to bring it back.
+fn build_main_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    // Create main window programmatically so we can set data_directory
+    // for portable mode (redirects WebView2 cache to portable Data dir)
+    let mut win_builder =
+        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
+            .title("Handy")
+            .inner_size(680.0, 570.0)
+            .min_inner_size(680.0, 570.0)
+            .resizable(true)
+            .maximizable(true)
+            .visible(false);
+
+    if let Some(data_dir) = portable::data_dir() {
+        win_builder = win_builder.data_directory(data_dir.join("webview"));
     }
 
-    let webview_labels = app.webview_windows().keys().cloned().collect::<Vec<_>>();
-    log::error!(
-        "Main window not found. Webview labels: {:?}",
-        webview_labels
-    );
+    let main_window = win_builder.build()?;
+
+    // Disable WebView2 browser accelerators (F5, F6, Ctrl+F, F12, ...).
+    // A settings window has no use for them, and pressing F6 while
+    // recording a shortcut was reported to turn the whole window white
+    // (cjpais/Handy#1940), likely by triggering WebView2 focus cycling.
+    // DevTools stays enabled; only the F12 accelerator is lost.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = main_window.with_webview(|webview| unsafe {
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+            use windows::core::Interface;
+
+            let result = webview
+                .controller()
+                .CoreWebView2()
+                .and_then(|core| core.Settings())
+                .and_then(|settings| settings.cast::<ICoreWebView2Settings3>())
+                .and_then(|settings| settings.SetAreBrowserAcceleratorKeysEnabled(false));
+
+            if let Err(error) = result {
+                log::warn!("Failed to disable WebView2 browser accelerators: {error}");
+            }
+        });
+    }
+
+    Ok(main_window)
+}
+
+fn show_main_window(app: &AppHandle) {
+    let main_window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => match build_main_window(app) {
+            Ok(window) => {
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                shortcut::apply_window_theme(app, get_settings(app).theme);
+                window
+            }
+            Err(e) => {
+                log::error!("Failed to create main window: {}", e);
+                return;
+            }
+        },
+    };
+
+    if let Err(e) = main_window.unminimize() {
+        log::error!("Failed to unminimize webview window: {}", e);
+    }
+    if let Err(e) = main_window.show() {
+        log::error!("Failed to show webview window: {}", e);
+    }
+    if let Err(e) = main_window.set_focus() {
+        log::error!("Failed to focus webview window: {}", e);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+            log::error!("Failed to set activation policy to Regular: {}", e);
+        }
+    }
 }
 
 /// Choose the macOS activation policy the process *launches* with.
@@ -940,48 +994,7 @@ pub fn run(cli_args: CliArgs) {
                 return Ok(());
             }
 
-            // Create main window programmatically so we can set data_directory
-            // for portable mode (redirects WebView2 cache to portable Data dir)
-            let mut win_builder =
-                tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("/".into()))
-                    .title("Handy")
-                    .inner_size(680.0, 570.0)
-                    .min_inner_size(680.0, 570.0)
-                    .resizable(true)
-                    .maximizable(true)
-                    .visible(false);
-
-            if let Some(data_dir) = portable::data_dir() {
-                win_builder = win_builder.data_directory(data_dir.join("webview"));
-            }
-
-            // Only used on Windows, to disable WebView2 browser accelerators.
-            #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
-            let main_window = win_builder.build()?;
-
-            // Disable WebView2 browser accelerators (F5, F6, Ctrl+F, F12, ...).
-            // A settings window has no use for them, and pressing F6 while
-            // recording a shortcut was reported to turn the whole window white
-            // (cjpais/Handy#1940), likely by triggering WebView2 focus cycling.
-            // DevTools stays enabled; only the F12 accelerator is lost.
-            #[cfg(target_os = "windows")]
-            {
-                let _ = main_window.with_webview(|webview| unsafe {
-                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
-                    use windows::core::Interface;
-
-                    let result = webview
-                        .controller()
-                        .CoreWebView2()
-                        .and_then(|core| core.Settings())
-                        .and_then(|settings| settings.cast::<ICoreWebView2Settings3>())
-                        .and_then(|settings| settings.SetAreBrowserAcceleratorKeysEnabled(false));
-
-                    if let Err(error) = result {
-                        log::warn!("Failed to disable WebView2 browser accelerators: {error}");
-                    }
-                });
-            }
+            build_main_window(app.handle())?;
 
             let mut settings = get_settings(app.handle());
 
@@ -1063,8 +1076,16 @@ pub fn run(cli_args: CliArgs) {
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _res = window.hide();
+                if window.label() == "main" {
+                    // Let the settings window close for real (see
+                    // `build_main_window`). A shortcut capture still in progress
+                    // left every binding suspended, and the page that would
+                    // resume them is about to be gone.
+                    shortcut::resume_all_shortcuts(window.app_handle());
+                } else {
+                    api.prevent_close();
+                    let _res = window.hide();
+                }
 
                 #[cfg(target_os = "macos")]
                 {
@@ -1118,6 +1139,12 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
+        // Closing the settings window destroys it, which would end the app if
+        // no other window were left. Explicit exits (tray Quit, updater) carry
+        // a code and still go through.
+        tauri::RunEvent::ExitRequested {
+            code: None, api, ..
+        } => api.prevent_exit(),
         // No transcription teardown on exit: transcribe.cpp runs only in the
         // worker process, which exits by itself as soon as this process's end
         // of its stdin closes, even if it is hung. Waiting on an unload here
