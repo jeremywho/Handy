@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "نموذج غير معروف",
     "pasteFailedTitle": "فشل لصق النص",
     "pasteFailed": "تعذر لصق النص في التطبيق النشط.",
-    "transcriptionFailedTitle": "فشل التفريغ النصي"
+    "transcriptionFailedTitle": "فشل التفريغ النصي",
+    "updateInstalling": "جارٍ تثبيت تحديث. حاول مرة أخرى بعد دقيقة."
   },
   "appLanguage": {
     "title": "لغة التطبيق",

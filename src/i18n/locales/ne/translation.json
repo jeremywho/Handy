@@ -694,7 +694,8 @@
     "modelLoadFailedUnknown": "अज्ञात मोडेल",
     "pasteFailedTitle": "टेक्स्ट पेस्ट गर्न सकिएन",
     "pasteFailed": "सक्रिय एपमा टेक्स्ट पेस्ट गर्न सकिएन।",
-    "transcriptionFailedTitle": "ट्रान्सक्रिप्सन गर्न सकिएन"
+    "transcriptionFailedTitle": "ट्रान्सक्रिप्सन गर्न सकिएन",
+    "updateInstalling": "अपडेट स्थापना हुँदैछ। एक मिनेटपछि फेरि प्रयास गर्नुहोस्।"
   },
   "appLanguage": {
     "title": "एपको भाषा",

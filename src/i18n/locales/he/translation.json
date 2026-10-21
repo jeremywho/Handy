@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "מודל לא ידוע",
     "pasteFailedTitle": "ההדבקה נכשלה",
     "pasteFailed": "לא ניתן היה להדביק את הטקסט ביישום הפעיל.",
-    "transcriptionFailedTitle": "התמלול נכשל"
+    "transcriptionFailedTitle": "התמלול נכשל",
+    "updateInstalling": "מתבצעת התקנה של עדכון. נסה שוב בעוד דקה."
   },
   "appLanguage": {
     "title": "שפת האפליקציה",

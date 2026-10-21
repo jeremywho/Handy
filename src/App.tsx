@@ -155,6 +155,8 @@ function App() {
         toast.error(t("errors.noInputDeviceTitle"), {
           description: t("errors.noInputDevice"),
         });
+      } else if (error_type === "update_installing") {
+        toast.error(t("errors.updateInstalling"));
       } else {
         toast.error(
           t("errors.recordingFailed", { error: detail ?? "Unknown error" }),

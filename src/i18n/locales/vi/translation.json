@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "mô hình không xác định",
     "pasteFailedTitle": "Không thể dán văn bản",
     "pasteFailed": "Không thể dán văn bản vào ứng dụng đang hoạt động.",
-    "transcriptionFailedTitle": "Phiên âm thất bại"
+    "transcriptionFailedTitle": "Phiên âm thất bại",
+    "updateInstalling": "Đang cài đặt bản cập nhật. Hãy thử lại sau một phút."
   },
   "appLanguage": {
     "title": "Ngôn ngữ ứng dụng",

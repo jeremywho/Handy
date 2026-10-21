@@ -694,7 +694,8 @@
     "modelLoadFailedUnknown": "model tidak dikenal",
     "pasteFailedTitle": "Gagal Menempelkan Teks",
     "pasteFailed": "Teks tidak dapat ditempelkan ke aplikasi aktif.",
-    "transcriptionFailedTitle": "Transkripsi Gagal"
+    "transcriptionFailedTitle": "Transkripsi Gagal",
+    "updateInstalling": "Pembaruan sedang dipasang. Coba lagi dalam satu menit."
   },
   "appLanguage": {
     "title": "Bahasa Aplikasi",

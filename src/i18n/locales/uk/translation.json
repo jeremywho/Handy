@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "невідома модель",
     "pasteFailedTitle": "Не вдалося вставити текст",
     "pasteFailed": "Не вдалося вставити текст до активної програми.",
-    "transcriptionFailedTitle": "Помилка транскрипції"
+    "transcriptionFailedTitle": "Помилка транскрипції",
+    "updateInstalling": "Встановлюється оновлення. Спробуйте ще раз за хвилину."
   },
   "appLanguage": {
     "title": "Мова інтерфейсу",

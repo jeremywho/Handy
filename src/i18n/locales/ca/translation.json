@@ -694,7 +694,8 @@
     "modelLoadFailedUnknown": "model desconegut",
     "pasteFailedTitle": "No s'ha pogut enganxar el text",
     "pasteFailed": "No s'ha pogut enganxar el text a l'aplicació activa.",
-    "transcriptionFailedTitle": "La transcripció ha fallat"
+    "transcriptionFailedTitle": "La transcripció ha fallat",
+    "updateInstalling": "S'està instal·lant una actualització. Torna-ho a provar d'aquí a un minut."
   },
   "appLanguage": {
     "title": "Llengua de l'aplicació",

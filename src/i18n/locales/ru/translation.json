@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "неизвестная модель",
     "pasteFailedTitle": "Не удалось вставить текст",
     "pasteFailed": "Не удалось вставить текст в активное приложение.",
-    "transcriptionFailedTitle": "Ошибка транскрипции"
+    "transcriptionFailedTitle": "Ошибка транскрипции",
+    "updateInstalling": "Устанавливается обновление. Повторите попытку через минуту."
   },
   "appLanguage": {
     "title": "Язык приложения",

@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "modello sconosciuto",
     "pasteFailedTitle": "Impossibile incollare il testo",
     "pasteFailed": "Non è stato possibile incollare il testo nell'applicazione attiva.",
-    "transcriptionFailedTitle": "Trascrizione non riuscita"
+    "transcriptionFailedTitle": "Trascrizione non riuscita",
+    "updateInstalling": "È in corso l'installazione di un aggiornamento. Riprova tra un minuto."
   },
   "appLanguage": {
     "title": "Lingua Applicazione",

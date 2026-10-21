@@ -1,4 +1,5 @@
 use crate::actions::process_transcription_output;
+use crate::activity_gate::ActivityGate;
 use crate::managers::{
     history::{HistoryManager, PaginatedHistory},
     transcription::TranscriptionManager,
@@ -65,8 +66,13 @@ pub async fn retry_history_entry_transcription(
     app: AppHandle,
     history_manager: State<'_, Arc<HistoryManager>>,
     transcription_manager: State<'_, Arc<TranscriptionManager>>,
+    activity_gate: State<'_, Arc<ActivityGate>>,
     id: i64,
 ) -> Result<(), String> {
+    let _permit = activity_gate
+        .try_acquire()
+        .map_err(|_| "An update is installing. Try again in a minute.".to_string())?;
+
     let entry = history_manager
         .get_entry_by_id(id)
         .await

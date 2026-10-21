@@ -1,3 +1,4 @@
+use crate::activity_gate::ActivityGate;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
@@ -26,9 +27,9 @@ use tauri::{AppHandle, Emitter};
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, serde::Serialize)]
-struct RecordingErrorEvent {
-    error_type: String,
-    detail: Option<String>,
+pub(crate) struct RecordingErrorEvent {
+    pub(crate) error_type: String,
+    pub(crate) detail: Option<String>,
 }
 
 /// Drop guard that finishes the transcription pipeline, including immediate
@@ -602,6 +603,7 @@ impl ShortcutAction for TranscribeAction {
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
         let cancel_generation = rm.cancel_generation();
+        let permit = app.state::<Arc<ActivityGate>>().take_dictation();
 
         tauri::async_runtime::spawn(async move {
             let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
@@ -754,6 +756,9 @@ impl ShortcutAction for TranscribeAction {
                                         return;
                                     }
 
+                                    let restores_async =
+                                        cfg!(any(target_os = "macos", target_os = "windows"))
+                                            && get_settings(&ah_clone).reliable_paste;
                                     match utils::paste(final_text, ah_clone.clone()) {
                                         Ok(()) => debug!(
                                             "Text pasted successfully in {:?}",
@@ -763,6 +768,12 @@ impl ShortcutAction for TranscribeAction {
                                             error!("Failed to paste transcription: {}", e);
                                             let _ = ah_clone.emit("paste-error", ());
                                         }
+                                    }
+                                    match permit {
+                                        Some(permit) if restores_async => {
+                                            permit.release_after(crate::paste_tx::RESTORE_TIMEOUT)
+                                        }
+                                        permit => drop(permit),
                                     }
                                     utils::hide_recording_overlay(&ah_clone);
                                     set_tray_state(&ah_clone, TrayIconState::Idle);

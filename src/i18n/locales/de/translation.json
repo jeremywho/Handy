@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "unbekanntes Modell",
     "pasteFailedTitle": "Text konnte nicht eingefügt werden",
     "pasteFailed": "Der Text konnte nicht in die aktive Anwendung eingefügt werden.",
-    "transcriptionFailedTitle": "Transkription fehlgeschlagen"
+    "transcriptionFailedTitle": "Transkription fehlgeschlagen",
+    "updateInstalling": "Ein Update wird installiert. Versuche es in einer Minute erneut."
   },
   "appLanguage": {
     "title": "Anwendungssprache",

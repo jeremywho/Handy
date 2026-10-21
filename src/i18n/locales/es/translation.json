@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "modelo desconocido",
     "pasteFailedTitle": "Error al pegar el texto",
     "pasteFailed": "No se pudo pegar el texto en la aplicación activa.",
-    "transcriptionFailedTitle": "Error de transcripción"
+    "transcriptionFailedTitle": "Error de transcripción",
+    "updateInstalling": "Se está instalando una actualización. Inténtalo de nuevo en un minuto."
   },
   "appLanguage": {
     "title": "Idioma de la aplicación",

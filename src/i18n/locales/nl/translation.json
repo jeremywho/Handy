@@ -694,7 +694,8 @@
     "modelLoadFailedUnknown": "onbekend model",
     "pasteFailedTitle": "Tekst plakken mislukt",
     "pasteFailed": "Tekst kon niet worden geplakt in de actieve applicatie.",
-    "transcriptionFailedTitle": "Transcriptie mislukt"
+    "transcriptionFailedTitle": "Transcriptie mislukt",
+    "updateInstalling": "Er wordt een update geïnstalleerd. Probeer het over een minuut opnieuw."
   },
   "appLanguage": {
     "title": "Interfacetaal",

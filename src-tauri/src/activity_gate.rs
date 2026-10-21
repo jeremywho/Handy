@@ -57,6 +57,7 @@ impl ActivityGate {
 
     /// Succeeds only when no permit is live (a parked dictation permit counts) and no
     /// other install is in progress. New permits are refused until the guard drops.
+    #[must_use = "dropping the InstallGuard ends the install window immediately"]
     pub fn try_begin_install(self: &Arc<Self>) -> Option<InstallGuard> {
         let mut state = self.state();
         if state.active > 0 || state.installing {

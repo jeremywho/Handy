@@ -1,4 +1,5 @@
-use crate::actions::ACTION_MAP;
+use crate::actions::{RecordingErrorEvent, ACTION_MAP};
+use crate::activity_gate::{ActivityGate, InstallInProgress};
 use crate::managers::audio::AudioRecordingManager;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
@@ -6,7 +7,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
@@ -691,14 +692,36 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return false;
     };
+    let gate = app.state::<Arc<ActivityGate>>();
+    if admit_start(&gate, binding_id).is_err() {
+        warn!("Not starting '{binding_id}': an update is installing");
+        let _ = app.emit(
+            "recording-error",
+            RecordingErrorEvent {
+                error_type: "update_installing".to_string(),
+                detail: None,
+            },
+        );
+        return false;
+    }
     action.start(app, binding_id, hotkey_string);
     let recording = app
         .try_state::<Arc<AudioRecordingManager>>()
         .is_some_and(|a| a.is_recording());
     if !recording {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
+        gate.drop_dictation();
     }
     recording
+}
+
+/// Parks a dictation permit for transcribe bindings, which the stop handler
+/// takes over; other bindings pass through without touching the gate.
+fn admit_start(gate: &Arc<ActivityGate>, binding_id: &str) -> Result<(), InstallInProgress> {
+    if is_transcribe_binding(binding_id) {
+        gate.park_dictation(gate.try_acquire()?);
+    }
+    Ok(())
 }
 
 fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
@@ -1203,6 +1226,49 @@ mod tests {
 
         state.on_start_result(BINDING, false);
         assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn start_refused_when_gate_installing_rolls_back_to_idle() {
+        let gate = ActivityGate::new();
+        let _install = gate.try_begin_install().expect("install on idle gate");
+        let mut state = CoordinatorState::new();
+
+        let Some(Effect::Start { binding_id, .. }) =
+            state.on_input(ptt_input(true), Instant::now())
+        else {
+            panic!("expected a Start effect");
+        };
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+
+        let admitted = admit_start(&gate, &binding_id);
+        assert_eq!(admitted, Err(InstallInProgress));
+        state.on_start_result(&binding_id, admitted.is_ok());
+
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(gate.take_dictation().is_none());
+    }
+
+    #[test]
+    fn admit_start_passes_non_transcribe_bindings_while_installing() {
+        let gate = ActivityGate::new();
+        let _install = gate.try_begin_install().expect("install on idle gate");
+
+        assert_eq!(admit_start(&gate, "cancel"), Ok(()));
+        assert_eq!(admit_start(&gate, "test"), Ok(()));
+        assert!(gate.take_dictation().is_none());
+    }
+
+    #[test]
+    fn admit_start_parks_a_permit_for_transcribe_bindings() {
+        for binding_id in [BINDING, OTHER_BINDING] {
+            let gate = ActivityGate::new();
+            assert_eq!(admit_start(&gate, binding_id), Ok(()));
+            assert!(gate.try_begin_install().is_none());
+
+            gate.drop_dictation();
+            assert!(gate.try_begin_install().is_some());
+        }
     }
 
     // ---------------------------------------------------------------------

@@ -694,7 +694,8 @@
     "modelLoadFailedUnknown": "अज्ञात मॉडल",
     "pasteFailedTitle": "टेक्स्ट पेस्ट नहीं हो सका",
     "pasteFailed": "खुले हुए ऐप्लिकेशन में टेक्स्ट पेस्ट नहीं किया जा सका.",
-    "transcriptionFailedTitle": "ट्रांसक्रिप्शन नहीं हो सका"
+    "transcriptionFailedTitle": "ट्रांसक्रिप्शन नहीं हो सका",
+    "updateInstalling": "एक अपडेट इंस्टॉल हो रहा है। एक मिनट में फिर से प्रयास करें।"
   },
   "appLanguage": {
     "title": "ऐप्लिकेशन की भाषा",

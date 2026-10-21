@@ -691,7 +691,8 @@
     "modelLoadFailedUnknown": "bilinmeyen model",
     "pasteFailedTitle": "Metin yapıştırılamadı",
     "pasteFailed": "Metin etkin uygulamaya yapıştırılamadı.",
-    "transcriptionFailedTitle": "Transkripsiyon başarısız oldu"
+    "transcriptionFailedTitle": "Transkripsiyon başarısız oldu",
+    "updateInstalling": "Bir güncelleme yükleniyor. Bir dakika sonra tekrar deneyin."
   },
   "appLanguage": {
     "title": "Uygulama Dili",

@@ -1,5 +1,5 @@
 mod actions;
-pub mod activity_gate;
+mod activity_gate;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod apple_intelligence;
 mod audio_feedback;
@@ -445,6 +445,24 @@ fn show_main_window_command(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+#[tauri::command]
+fn debug_hold_install_gate(
+    gate: tauri::State<'_, Arc<activity_gate::ActivityGate>>,
+    seconds: u64,
+) -> Result<(), String> {
+    let guard = gate
+        .try_begin_install()
+        .ok_or_else(|| "activity gate is busy".to_string())?;
+    log::info!("debug_hold_install_gate: holding the install gate for {seconds}s");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        drop(guard);
+        log::info!("debug_hold_install_gate: released the install gate");
+    });
+    Ok(())
+}
+
 /// Convert an unexpected panic on the headless worker into a normal CLI
 /// failure. Without this guard the Tauri event loop remains alive after the
 /// worker exits, leaving `--transcribe-file` hung indefinitely.
@@ -836,7 +854,22 @@ pub fn run(cli_args: CliArgs) {
         )
         .expect("Failed to export typescript bindings");
 
-    let invoke_handler = specta_builder.invoke_handler();
+    let specta_handler = specta_builder.invoke_handler();
+    // Kept out of specta so the debug-only command never reaches the committed bindings.ts.
+    #[cfg(debug_assertions)]
+    let invoke_handler = {
+        let debug_handler: Box<dyn Fn(tauri::ipc::Invoke) -> bool + Send + Sync> =
+            Box::new(tauri::generate_handler![debug_hold_install_gate]);
+        move |invoke: tauri::ipc::Invoke| {
+            if invoke.message.command() == "debug_hold_install_gate" {
+                debug_handler(invoke)
+            } else {
+                specta_handler(invoke)
+            }
+        }
+    };
+    #[cfg(not(debug_assertions))]
+    let invoke_handler = specta_handler;
 
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
