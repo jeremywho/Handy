@@ -366,9 +366,12 @@ repository-level secret that `secrets: inherit` could pass on.
   - the workflow's last successful run is more than 36 hours old
   - any run failed or stopped for review since the last check
   - the installed app has been behind the latest fork release for more
-    than a day. It compares the file version of
-    `%LOCALAPPDATA%\Handy\handy.exe` with the release. This also catches a
-    failed self-install that left Handy down or on an older version.
+    than a day. It compares `DisplayVersion` under
+    `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy`, which
+    NSIS writes from the full version, with the release; the `handy.exe` file
+    version is always `0.9.8.0` and cannot tell fork releases apart. This
+    also catches a failed self-install that left Handy down or on an older
+    version.
 - **Why not rely on GitHub:** GitHub can delay or drop scheduled runs and
   can disable them after 60 days without activity. GitHub's failure email
   goes to whoever last edited the cron, so it is not relied on.

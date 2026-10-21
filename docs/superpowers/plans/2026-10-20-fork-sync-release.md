@@ -505,13 +505,16 @@ The workflow:
 
 **Steps that only Jeremy can do** are marked **(Jeremy)**. Each one comes to him as an exact command or click path.
 
-- [ ] **Step 1:** Push `jw` and make it the default branch. Check that no workflow run starts.
+- [ ] **Step 1:** Push `jw` and make it the default branch. Check that the push started exactly one run, and that it stopped at the missing secrets.
   - Run: `git push fork jw`
   - Run: `gh repo edit jeremywho/Handy --default-branch jw`
-  - Run: `gh run list -R jeremywho/Handy`. Expected: empty.
-- [ ] **Step 2:** Disable every workflow except `fork-release.yml`.
+  - Run: `gh run list -R jeremywho/Handy`. Expected: exactly one `fork-release` run, from the push. The secrets don't exist yet, so it fails fast at the `sign` job with "release environment secrets missing".
+  - If that run is still running, cancel it: `gh run cancel <run-id> -R jeremywho/Handy`.
+- [ ] **Step 2:** Disable every workflow except `fork-release.yml`, and make sure its schedule is active.
   - Run: `gh workflow list --all` then `gh workflow disable <id>` for each.
   - Expected: `gh workflow list` shows only `fork-release` active.
+  - jeremywho/Handy is a GitHub fork, and GitHub may hold scheduled workflows in forks until they are enabled by hand. Run: `gh workflow view fork-release.yml -R jeremywho/Handy`. Expected: it is active.
+  - If it is not active, run: `gh workflow enable fork-release.yml -R jeremywho/Handy`, then view it again. Expected: active.
 - [ ] **Step 3: (Jeremy)** Create the fine-grained personal access token.
   - Click path: github.com → Settings → Developer settings → Fine-grained tokens → Generate.
   - Repository: `jeremywho/Handy`. Permissions: Contents RW, Workflows RW. Expiry: 1 year.
@@ -532,7 +535,7 @@ The workflow:
   Then I check:
   - the About screen shows `0.9.8-jw.1`
   - the history and the model are present
-  - `handy.exe --fork-selftest` reports `ok: true`
+  - `handy.exe --fork-selftest <path>` exits 0, and the JSON it writes to `<path>` has `ok: true`
   - dictation works.
 
   Restore procedure if anything is wrong: spec §Switch-over step 5.
@@ -544,4 +547,5 @@ The workflow:
   - Record whether SmartScreen appeared. That settles the spec's open question.
   - If Handy came back with its window open, apply the Task 7 marker fallback and repeat this step.
 - [ ] **Step 8:** Confirm the Talon watch reports no alerts with `node watch.mjs --dry-run`.
+  - Confirm the schedule fires. The cron runs every 6 hours, so about 6 hours after the first release in Step 5, run: `gh run list -R jeremywho/Handy --workflow fork-release.yml --event schedule`. Expected: at least one run. If none has appeared, re-check Step 2's `gh workflow view`. The Talon watch's 36-hour alert is the backstop.
 - [ ] **Step 9:** Update the project memory and `fork/patches.md` with what Steps 5 to 7 showed.
