@@ -69,6 +69,11 @@ impl ActivityGate {
         })
     }
 
+    pub fn is_free(&self) -> bool {
+        let state = self.state();
+        state.active == 0 && !state.installing
+    }
+
     /// Holds one recording's permit until the stop handler takes it. A permit already
     /// parked is replaced and released.
     pub fn park_dictation(&self, permit: ActivityPermit) {
@@ -161,6 +166,25 @@ mod tests {
         let permit = gate.try_acquire().expect("acquire after failed install");
         drop(permit);
         assert!(gate.try_begin_install().is_some());
+    }
+
+    #[test]
+    fn is_free_reflects_permits_and_installs_without_changing_them() {
+        let gate = ActivityGate::new();
+        assert!(gate.is_free());
+
+        let permit = gate.try_acquire().expect("acquire");
+        assert!(!gate.is_free());
+        drop(permit);
+        assert!(gate.is_free());
+
+        let guard = gate.try_begin_install().expect("install on idle gate");
+        assert!(!gate.is_free());
+        drop(guard);
+        assert!(gate.is_free());
+
+        let permit = gate.try_acquire().expect("is_free left the gate open");
+        drop(permit);
     }
 
     #[test]

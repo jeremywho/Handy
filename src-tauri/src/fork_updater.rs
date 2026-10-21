@@ -1,19 +1,100 @@
 use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, Url};
-use tauri_plugin_updater::{Updater, UpdaterExt};
+use tauri_plugin_store::StoreExt;
+use tauri_plugin_updater::{Update, Updater, UpdaterExt};
 
 use crate::activity_gate::ActivityGate;
-use crate::settings;
+use crate::settings::{self, AppSettings};
 
 pub const FORK_ENDPOINT: &str =
     "https://github.com/jeremywho/Handy/releases/latest/download/latest.json";
 pub const FORK_PUBKEY: &str = include_str!("../../fork/updater.pub");
 
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+pub const STARTUP_DELAY: Duration = Duration::from_secs(120);
+pub const REQUIRED_IDLE: Duration = Duration::from_secs(600);
+pub const IDLE_POLL: Duration = Duration::from_secs(30);
+
 const SELFTEST_FAILED: i32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    WaitInterval,
+    PollIdle,
+    Install,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disabled {
+    Portable,
+    UpdateChecksOff,
+}
+
+impl Disabled {
+    fn message(self) -> &'static str {
+        match self {
+            Disabled::Portable => "Portable installs update manually from the releases page.",
+            Disabled::UpdateChecksOff => "Update checks are disabled.",
+        }
+    }
+}
+
+fn disabled_reason(settings: &AppSettings, portable: bool) -> Option<Disabled> {
+    if portable {
+        Some(Disabled::Portable)
+    } else if !settings::update_checks_effectively_enabled(settings) {
+        Some(Disabled::UpdateChecksOff)
+    } else {
+        None
+    }
+}
+
+fn current_disabled_reason(app: &AppHandle) -> Option<Disabled> {
+    disabled_reason(&settings::get_settings(app), crate::portable::is_portable())
+}
+
+pub fn service_enabled(settings: &AppSettings, portable: bool) -> bool {
+    disabled_reason(settings, portable).is_none()
+}
+
+pub fn next_step(downloaded: bool, check_failed: bool, idle: Duration, gate_free: bool) -> Step {
+    if check_failed || !downloaded {
+        Step::WaitInterval
+    } else if idle >= REQUIRED_IDLE && gate_free {
+        Step::Install
+    } else {
+        Step::PollIdle
+    }
+}
+
+#[cfg(windows)]
+pub fn input_idle() -> Duration {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if !unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        return Duration::ZERO;
+    }
+    let now = unsafe { GetTickCount() };
+    // Both are u32 millisecond tick counts that wrap every 49.7 days; wrapping_sub stays exact across the wrap.
+    Duration::from_millis(u64::from(now.wrapping_sub(info.dwTime)))
+}
+
+#[cfg(not(windows))]
+pub fn input_idle() -> Duration {
+    Duration::ZERO
+}
 
 pub enum Restart {
     Hidden,
@@ -97,37 +178,167 @@ fn write_json(path: &Path, value: &Value) -> std::io::Result<()> {
     file.sync_all()
 }
 
-#[tauri::command]
-#[specta::specta]
-pub async fn install_update_now(app: AppHandle) -> Result<(), String> {
-    if crate::portable::is_portable() {
-        return Err("Portable installs update manually from the releases page.".to_string());
-    }
-    if !settings::update_checks_effectively_enabled(&settings::get_settings(&app)) {
-        return Err("Update checks are disabled.".to_string());
-    }
-
-    let updater = build_updater(&app, Restart::Normal)?;
+async fn check_and_download(updater: &Updater) -> Result<Option<(Update, Vec<u8>)>, String> {
     let Some(update) = updater
         .check()
         .await
         .map_err(|e| format!("Update check failed: {e}"))?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let bytes = update
         .download(|_, _| {}, || {})
         .await
         .map_err(|e| format!("Update download failed: {e}"))?;
+    Ok(Some((update, bytes)))
+}
+
+fn flush_settings(app: &AppHandle) -> Result<(), String> {
+    app.store(crate::portable::store_path(settings::SETTINGS_STORE_PATH))
+        .map_err(|e| format!("Failed to open the settings store: {e}"))?
+        .save()
+        .map_err(|e| format!("Failed to save the settings store: {e}"))
+}
+
+fn flush_then_install(app: &AppHandle, update: &Update, bytes: &[u8]) -> Result<(), String> {
+    flush_settings(app)?;
+    update
+        .install(bytes)
+        .map_err(|e| format!("Update install failed: {e}"))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn install_update_now(app: AppHandle) -> Result<(), String> {
+    if let Some(reason) = current_disabled_reason(&app) {
+        return Err(reason.message().to_string());
+    }
+
+    let updater = build_updater(&app, Restart::Normal)?;
+    let Some((update, bytes)) = check_and_download(&updater).await? else {
+        return Ok(());
+    };
 
     let gate = app.state::<Arc<ActivityGate>>();
     let _install_guard = gate
         .try_begin_install()
         .ok_or_else(|| "Handy is busy. Try again when dictation finishes.".to_string())?;
-    update
-        .install(bytes)
-        .map_err(|e| format!("Update install failed: {e}"))?;
+    flush_then_install(&app, &update, &bytes)?;
     app.restart()
+}
+
+pub fn spawn_background(app: &AppHandle) {
+    let app = app.clone();
+    let spawned = thread::Builder::new()
+        .name("fork-updater".into())
+        .spawn(move || {
+            log::info!(
+                "fork updater: started; first check in {}s",
+                STARTUP_DELAY.as_secs()
+            );
+            thread::sleep(STARTUP_DELAY);
+            loop {
+                if panic::catch_unwind(AssertUnwindSafe(|| run_cycle(&app))).is_err() {
+                    log::error!("fork updater: update cycle panicked; the service keeps running");
+                }
+                log::info!("fork updater: next check in {}s", CHECK_INTERVAL.as_secs());
+                thread::sleep(CHECK_INTERVAL);
+            }
+        });
+    if let Err(e) = spawned {
+        log::error!("fork updater: failed to start the background thread: {e}");
+    }
+}
+
+fn run_cycle(app: &AppHandle) {
+    if let Some(reason) = current_disabled_reason(app) {
+        log::info!("fork updater: service disabled ({reason:?})");
+        return;
+    }
+
+    log::info!("fork updater: checking {FORK_ENDPOINT}");
+    let result = build_updater(app, Restart::Hidden)
+        .and_then(|updater| tauri::async_runtime::block_on(check_and_download(&updater)));
+    let (pending, check_failed) = match result {
+        Ok(Some((update, bytes))) => {
+            log::info!(
+                "fork updater: downloaded and verified {} ({} bytes); installing after {}s without input",
+                update.version,
+                bytes.len(),
+                REQUIRED_IDLE.as_secs()
+            );
+            (Some((update, bytes)), false)
+        }
+        Ok(None) => {
+            log::info!("fork updater: no update available");
+            (None, false)
+        }
+        Err(e) => {
+            log::info!("fork updater: {e}");
+            (None, true)
+        }
+    };
+
+    let gate = Arc::clone(app.state::<Arc<ActivityGate>>().inner());
+    let mut last_wait = None;
+    loop {
+        if !service_enabled(&settings::get_settings(app), crate::portable::is_portable()) {
+            log::info!("fork updater: service disabled; abandoning this cycle");
+            return;
+        }
+        let idle = input_idle();
+        let gate_free = gate.is_free();
+        match next_step(pending.is_some(), check_failed, idle, gate_free) {
+            Step::WaitInterval => return,
+            Step::PollIdle => {
+                let wait = (idle >= REQUIRED_IDLE, gate_free);
+                if last_wait != Some(wait) {
+                    log::info!(
+                        "fork updater: waiting to install (idle {}s, dictation idle: {gate_free}); polling every {}s",
+                        idle.as_secs(),
+                        IDLE_POLL.as_secs()
+                    );
+                    last_wait = Some(wait);
+                }
+            }
+            Step::Install => {
+                if let Some((update, bytes)) = &pending {
+                    try_install(app, &gate, update, bytes);
+                }
+                last_wait = None;
+            }
+        }
+        thread::sleep(IDLE_POLL);
+    }
+}
+
+fn try_install(app: &AppHandle, gate: &Arc<ActivityGate>, update: &Update, bytes: &[u8]) {
+    let Some(guard) = gate.try_begin_install() else {
+        log::info!("fork updater: dictation started before install; polling again");
+        return;
+    };
+    let idle = input_idle();
+    if idle < REQUIRED_IDLE {
+        drop(guard);
+        log::info!(
+            "fork updater: input {}s ago, before install; polling again",
+            idle.as_secs()
+        );
+        return;
+    }
+
+    log::info!(
+        "fork updater: installing {} after {}s idle; Handy restarts hidden",
+        update.version,
+        idle.as_secs()
+    );
+    match flush_then_install(app, update, bytes) {
+        Ok(()) => app.restart(),
+        Err(e) => {
+            drop(guard);
+            log::warn!("fork updater: {e}; polling again");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +415,93 @@ mod tests {
         assert_eq!(report(&[], FORK_PUBKEY)["ok"], false);
         assert_eq!(report(&fork_endpoints, "other-key")["ok"], false);
         assert_eq!(report(&fork_endpoints, "")["ok"], false);
+    }
+
+    const IDLE_ENOUGH: Duration = REQUIRED_IDLE;
+    const NOT_IDLE: Duration = Duration::from_secs(599);
+
+    #[test]
+    fn next_step_on_check_error_waits() {
+        for downloaded in [false, true] {
+            for gate_free in [false, true] {
+                for idle in [Duration::ZERO, NOT_IDLE, IDLE_ENOUGH, CHECK_INTERVAL] {
+                    assert_eq!(
+                        next_step(downloaded, true, idle, gate_free),
+                        Step::WaitInterval,
+                        "downloaded={downloaded} gate_free={gate_free} idle={idle:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            next_step(false, false, IDLE_ENOUGH, true),
+            Step::WaitInterval
+        );
+    }
+
+    #[test]
+    fn next_step_waits_for_ten_minutes_idle() {
+        assert_eq!(REQUIRED_IDLE, Duration::from_secs(600));
+        assert_eq!(next_step(true, false, Duration::ZERO, true), Step::PollIdle);
+        assert_eq!(next_step(true, false, NOT_IDLE, true), Step::PollIdle);
+        assert_eq!(next_step(true, false, IDLE_ENOUGH, true), Step::Install);
+        assert_eq!(next_step(true, false, CHECK_INTERVAL, true), Step::Install);
+    }
+
+    #[test]
+    fn next_step_polls_when_gate_busy_even_if_idle() {
+        assert_eq!(next_step(true, false, IDLE_ENOUGH, false), Step::PollIdle);
+        assert_eq!(
+            next_step(true, false, CHECK_INTERVAL, false),
+            Step::PollIdle
+        );
+    }
+
+    const SERVICE_CHILD_ENV: &str = "HANDY_FORK_UPDATER_TEST_CHILD";
+    const SERVICE_TEST: &str = "fork_updater::tests::service_disabled_for_portable_or_opt_out";
+
+    fn run_service_child(mode: &str, forced_off: bool) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", SERVICE_TEST, "--test-threads=1"])
+            .env(SERVICE_CHILD_ENV, mode);
+        if forced_off {
+            command.env("HANDY_DISABLE_UPDATER", "1");
+        } else {
+            command.env_remove("HANDY_DISABLE_UPDATER");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "child {mode} failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn service_disabled_for_portable_or_opt_out() {
+        let normal = settings::get_default_settings();
+        let mut opted_out = settings::get_default_settings();
+        opted_out.update_checks_enabled = false;
+
+        match std::env::var(SERVICE_CHILD_ENV).as_deref() {
+            Ok("forced_off") => {
+                assert!(settings::update_checks_forced_disabled());
+                assert!(!service_enabled(&normal, false));
+            }
+            Ok("normal") => {
+                assert!(!settings::update_checks_forced_disabled());
+                assert!(service_enabled(&normal, false));
+                assert!(!service_enabled(&normal, true));
+            }
+            _ => {
+                assert!(!service_enabled(&normal, true));
+                assert!(!service_enabled(&opted_out, false));
+                assert!(!service_enabled(&opted_out, true));
+                run_service_child("forced_off", true);
+                run_service_child("normal", false);
+            }
+        }
     }
 }
