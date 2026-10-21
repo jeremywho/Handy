@@ -238,8 +238,15 @@ pub fn spawn_background(app: &AppHandle) {
             );
             thread::sleep(STARTUP_DELAY);
             loop {
-                if panic::catch_unwind(AssertUnwindSafe(|| run_cycle(&app))).is_err() {
-                    log::error!("fork updater: update cycle panicked; the service keeps running");
+                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| run_cycle(&app))) {
+                    let reason = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("non-string panic payload");
+                    log::error!(
+                        "fork updater: update cycle panicked ({reason}); the service keeps running"
+                    );
                 }
                 log::info!("fork updater: next check in {}s", CHECK_INTERVAL.as_secs());
                 thread::sleep(CHECK_INTERVAL);
