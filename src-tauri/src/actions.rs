@@ -25,6 +25,8 @@ use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+// paste_tx can still be restoring the clipboard past RESTORE_TIMEOUT (slow WM_TIMER, locked clipboard).
+const RELIABLE_PASTE_RELEASE_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct RecordingErrorEvent {
@@ -770,9 +772,10 @@ impl ShortcutAction for TranscribeAction {
                                         }
                                     }
                                     match permit {
-                                        Some(permit) if restores_async => {
-                                            permit.release_after(crate::paste_tx::RESTORE_TIMEOUT)
-                                        }
+                                        Some(permit) if restores_async => permit.release_after(
+                                            crate::paste_tx::RESTORE_TIMEOUT
+                                                + RELIABLE_PASTE_RELEASE_MARGIN,
+                                        ),
                                         permit => drop(permit),
                                     }
                                     utils::hide_recording_overlay(&ah_clone);
