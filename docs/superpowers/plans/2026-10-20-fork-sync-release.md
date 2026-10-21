@@ -8,7 +8,7 @@
 - **Branch:** `jw` is the fork's default branch, based on upstream's release tags.
 - **Release workflow:** one GitHub workflow, `fork-release.yml`, does the plan, test, build, sign and publish steps. Small Node scripts in `fork/scripts/` hold all the decision logic so it can be unit-tested.
 - **In the app:** an `ActivityGate` keeps installs from interrupting a dictation. A single `fork_updater` module builds every updater and runs the background service.
-- **Monitoring:** a daily Talon task pushes alerts to Jeremy's phone.
+- **Monitoring:** none beyond GitHub's failed-run emails and the Actions page; the owner dropped the Talon watch (Task 10).
 
 **Tech Stack:** Tauri 2.11.5, `tauri-plugin-updater` 2.10.1, `@tauri-apps/cli` 2.11.4, Rust, React/TypeScript, Bun, Node 22 (scripts use only built-in modules), GitHub Actions, NSIS.
 
@@ -31,13 +31,12 @@
   - An automatic install waits for 10 minutes without input, and Handy restarts hidden (`--start-hidden`).
 - Secrets:
   - GitHub environment `release` holds `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-  - GitHub environment `push` holds `FORK_PUSH_TOKEN`.
   - Backups go in the 1Password vault "Private".
-- **Plan-level change to the spec:** the spec says pushes use `GITHUB_TOKEN`. That token cannot push commits that change `.github/workflows/`, and every upstream rebase that edits a workflow produces such commits. So pushes and tags use a fine-grained personal access token instead.
-  - Scope: only `jeremywho/Handy`, with Contents and Workflows read/write.
-  - The token's own push re-triggers the workflow. That is harmless, because runs are serialized and the reconcile step returns no-op.
+- **No push, no token (R30):** the workflow never pushes `jw` and never creates a ref to a new commit.
+  - Each run takes the fork's commits `fork/base.json.sha..jw`. If upstream's latest release is newer than `fork/base.json`, it rebases them in the runner onto that release's tag; otherwise the candidate is `jw`'s head as it is. It tests, builds, signs and publishes that candidate.
+  - The release tag goes on `jw`'s existing head (`preRebaseHead`) through the API with `GITHUB_TOKEN` (`contents: write`). `provenance.json` records `{version, sourceSha, preRebaseHead, baseTag, baseSha, stampHash, installerSha256, runId}`.
+  - `jw` and `fork/base.json` move only when Jeremy pushes from his machine.
 - Third-party actions are pinned by full commit SHA.
-- Monitor thresholds: the last successful run is more than 36 hours old, or the installed version has lagged the latest release for more than 24 hours.
 - Build locally from `D:\Data\...`, never `C:\Data\...`; that path is a junction and Vite rejects it.
 
 ## Review Focus
@@ -430,8 +429,7 @@ The workflow:
      - Run `plan.mjs`.
      - On `rebase`:
        - Run `git rebase --onto <sha> <base.sha> jw`. Check that `git rev-list --merges` over the range is empty beforehand.
-       - Run `rebaseChecks`.
-       - Commit the updated `fork/base.json`.
+       - Run `rebaseChecks`. Nothing rewrites `fork/base.json`; provenance records the base.
      - Write a git bundle of the candidate as an artifact, plus a `candidate.json` artifact: `{sha, version, baseTag, baseSha, decision}`.
      - On `stop`, fail with the reason. On `noop`, end green with `release=false`.
      - Put the upstream `build.yml` diff in the step summary when it changed.
@@ -455,9 +453,9 @@ The workflow:
      - Check that upstream's latest Windows signature fails against the fork key.
      - Run `buildManifest`.
      - Write `provenance.json`: candidate and base SHAs, version, the stamp script's SHA-256, the installer's SHA-256 and `run_id`.
-  6. **`publish`** (ubuntu, `environment: push`, `contents: write`, `needs: [sign, test]`):
-     1. `git push --force-with-lease=jw:<plan's jw sha> <candidate>:refs/heads/jw`, using `FORK_PUSH_TOKEN`.
-     2. Create tag `vVERSION` on the candidate.
+  6. **`publish`** (ubuntu, no environment, `contents: write`, `needs: [sign, test]`):
+     1. (Dropped by R30: no push of `jw`.)
+     2. Create tag `vVERSION` on `jw`'s head (`preRebaseHead`) with `POST git/refs` and `GITHUB_TOKEN`; accept it if it already points there, fail if it points elsewhere.
      3. Create a draft release on that tag. Upload the installer, `.sig`, `latest.json` and `provenance.json`.
      4. Download them back and re-check the hashes and the signature.
      5. Promote the release with `draft=false`, `prerelease=false`, `make_latest=true`.
@@ -469,7 +467,9 @@ The workflow:
   - Run `actionlint .github/workflows/fork-release.yml` (install with `winget install rhysd.actionlint`). Expected: no errors.
 - [ ] **Step 2:** Commit with the message `fork: release workflow`. Its real check is Task 11's first run.
 
-### Task 10: Talon watch
+### Task 10: Talon watch (dropped by the owner)
+
+**Dropped.** The owner judged a monitor overkill; failures show in GitHub's failed-run emails and on the Actions page. Do not implement the steps below.
 
 **Files:**
 - Create `C:\Users\Jeremy\handy-fork-watch\watch.mjs`, `watch.test.mjs` and `fixtures\`.
@@ -505,23 +505,20 @@ The workflow:
 
 **Steps that only Jeremy can do** are marked **(Jeremy)**. Each one comes to him as an exact command or click path.
 
-- [ ] **Step 1:** Push `jw` and make it the default branch. Check that the push started exactly one run, and that it stopped at the missing secrets.
+- [ ] **Step 1:** Push `jw` and make it the default branch. The first push of `jw` triggers one `fork-release` run, which fails fast at the `sign` job until the `release` secrets exist; cancel it.
   - Run: `git push fork jw`
   - Run: `gh repo edit jeremywho/Handy --default-branch jw`
-  - Run: `gh run list -R jeremywho/Handy`. Expected: exactly one `fork-release` run, from the push. The secrets don't exist yet, so it fails fast at the `sign` job with "release environment secrets missing".
-  - If that run is still running, cancel it: `gh run cancel <run-id> -R jeremywho/Handy`.
+  - Run: `gh run list -R jeremywho/Handy`. Expected: exactly one `fork-release` run, from the push. Without the `release` secrets it fails at `sign` with "release environment secrets missing".
+  - Cancel it: `gh run cancel <run-id> -R jeremywho/Handy`.
 - [ ] **Step 2:** Disable every workflow except `fork-release.yml`, and make sure its schedule is active.
   - Run: `gh workflow list --all` then `gh workflow disable <id>` for each.
   - Expected: `gh workflow list` shows only `fork-release` active.
-  - jeremywho/Handy is a GitHub fork, and GitHub may hold scheduled workflows in forks until they are enabled by hand. Run: `gh workflow view fork-release.yml -R jeremywho/Handy`. Expected: it is active.
-  - If it is not active, run: `gh workflow enable fork-release.yml -R jeremywho/Handy`, then view it again. Expected: active.
-- [ ] **Step 3: (Jeremy)** Create the fine-grained personal access token.
-  - Click path: github.com → Settings → Developer settings → Fine-grained tokens → Generate.
-  - Repository: `jeremywho/Handy`. Permissions: Contents RW, Workflows RW. Expiry: 1 year.
-  - Store it in 1Password "Private".
-- [ ] **Step 4:** Create environments `release` and `push`, and set the secrets from 1Password with `op read`.
-  - Run: `gh secret set --env release`, then `gh secret set --env push`.
-  - Expected: `gh secret list --env release` shows 2, and `--env push` shows 1.
+  - jeremywho/Handy is a GitHub fork, and GitHub may hold scheduled workflows in forks until they are enabled by hand. Run: `gh api repos/jeremywho/Handy/actions/workflows/fork-release.yml --jq .state`. Expected: `active`.
+  - If it is not `active`, run: `gh workflow enable fork-release.yml -R jeremywho/Handy`, then run the `gh api` check again. Expected: `active`.
+- [ ] **Step 3:** (Dropped: under R30 there is no personal access token.)
+- [ ] **Step 4:** Create the environment `release` and set its secrets from 1Password with `op read`.
+  - Run: `gh secret set --env release`.
+  - Expected: `gh secret list --env release` shows 2.
 - [ ] **Step 5:** Run `gh workflow run fork-release.yml --ref jw` and watch it with `gh run watch`.
   - Expected: green, and release `v0.9.8-jw.1` is marked latest.
   - Expected: the public `latest.json` says `0.9.8-jw.1`.
@@ -546,6 +543,6 @@ The workflow:
   - Expected: Handy is running, its window is not shown, and the tray icon is present.
   - Record whether SmartScreen appeared. That settles the spec's open question.
   - If Handy came back with its window open, apply the Task 7 marker fallback and repeat this step.
-- [ ] **Step 8:** Confirm the Talon watch reports no alerts with `node watch.mjs --dry-run`.
-  - Confirm the schedule fires. The cron runs every 6 hours, so about 6 hours after the first release in Step 5, run: `gh run list -R jeremywho/Handy --workflow fork-release.yml --event schedule`. Expected: at least one run. If none has appeared, re-check Step 2's `gh workflow view`. The Talon watch's 36-hour alert is the backstop.
+- [ ] **Step 8:** Confirm the schedule fires.
+  - The cron runs every 6 hours, so about 6 hours after the first release in Step 5, run: `gh run list -R jeremywho/Handy --workflow fork-release.yml --event schedule`. Expected: at least one run. If none has appeared, re-run Step 2's check: `gh api repos/jeremywho/Handy/actions/workflows/fork-release.yml --jq .state` must print `active`.
 - [ ] **Step 9:** Update the project memory and `fork/patches.md` with what Steps 5 to 7 showed.

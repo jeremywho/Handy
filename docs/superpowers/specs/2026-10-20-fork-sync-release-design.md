@@ -17,8 +17,7 @@ send it upstream.
 Success: upstream ships vX.Y.Z. Usually within hours, and with no action from
 Jeremy, the fork publishes a release with his commits on top. His running
 Handy then installs that release by itself and keeps working. When anything
-goes wrong, nothing is published and he is told on his phone. This includes
-the automation silently stopping.
+goes wrong, nothing is published and the run fails on GitHub.
 
 ## Goals
 
@@ -30,7 +29,7 @@ the automation silently stopping.
 4. The installed app finds updates on the fork's releases only, and installs
    them without a click, only when no dictation is in flight.
 5. Fail loudly. A failed replay, test, build or publish leaves the last good
-   release as the update target and alerts Jeremy.
+   release as the update target and fails the run.
 
 ## Non-goals
 
@@ -52,7 +51,6 @@ the automation silently stopping.
 - Losing settings, models or history on the switch from stock to fork, or on
   any update.
 - Upstream workflows running in the fork, or getting at the signing key.
-- Automation that stops silently.
 
 ## Facts read from the source (upstream `main` 93c9ee0 and tag v0.9.8)
 
@@ -219,32 +217,44 @@ other than docs contains `cjpais/Handy/releases`.
   - the event is `push`, `schedule` or `workflow_dispatch`
   - the plan job's outcome is "release needed".
 
-  Every other path ends in an explicit skip or failure state that the
-  monitor can see.
+  Every other path ends in an explicit skip or failure state on the
+  Actions page.
+- **No push (R30):** the workflow never pushes `jw` and never creates a ref
+  to a new commit. Each run takes the fork's commits
+  `fork/base.json.sha..jw`. If upstream's latest release is newer than
+  `fork/base.json`, it rebases them in the runner onto that release's tag;
+  otherwise the candidate is `jw`'s head as it is. It tests, builds, signs
+  and publishes that candidate. `jw` and `fork/base.json` move only when
+  Jeremy pushes from his machine.
 - **Plan job** (Linux, read-only token):
   - Authenticated API calls, with bounded retries that respect rate-limit
     headers. "No change" is an explicit outcome, separate from an error.
   - **Reconcile first.** Read the latest published fork release's
     provenance and any draft fork releases. If a draft or tag matches a
     candidate that never finished, resume it with its existing version
-    before doing anything else.
+    before doing anything else. A rebased draft's source commit existed
+    only in the runner that built it, so a resume repeats the rebase.
   - Fetch upstream release tags into the upstream namespace and read
     upstream's latest non-draft, non-prerelease release.
   - Decide:
-    - **No-op** only when upstream equals `fork/base.json` and the `jw` head
-      equals the source SHA of the latest published release.
-    - **Rebase** when upstream has a newer release.
-    - **Build `jw`'s head** otherwise.
+    - **No-op** only when the latest published release's `preRebaseHead`
+      equals `jw`'s head and its `baseSha` equals upstream's latest
+      release.
+    - **Rebase** when upstream's latest release is newer than
+      `fork/base.json`, with `N` counted on upstream's version.
+    - **Build `jw`'s head** otherwise, with `N` counted on
+      `fork/base.json`'s version.
   - For a rebase, do it in the runner and stop on conflict.
   - Output a git bundle of the candidate, its SHA, and the computed version.
     Every later job verifies the bundle's SHA before using it.
-  - `jw` is never advanced to move the candidate between jobs.
+  - `jw` is never advanced, neither to move the candidate between jobs nor
+    after publishing.
 - **Workflow allowlist:**
   - A separate admin job holds `actions: write` and runs no candidate code.
   - Each run, it disables every workflow other than `fork-release.yml`
     through the Actions API.
-  - A rebase stops the run for review before `jw` can advance only if it
-    adds a new workflow file or touches `fork-release.yml`.
+  - A rebase stops the run for review only if it adds a new workflow file
+    or touches `fork-release.yml`.
   - Edits to existing upstream workflows don't stop it, because the admin
     job keeps them disabled. Seven of the last eight upstream releases
     edited an existing workflow, so stopping on those would mean a manual
@@ -286,21 +296,23 @@ other than docs contains `cjpais/Handy/releases`.
   - Check that upstream's current Windows signature fails against the fork's
     key (guard layer 3).
   - Write `provenance.json` containing:
-    - the candidate SHA and base tag and SHA
+    - the candidate SHA (`sourceSha`), `jw`'s head (`preRebaseHead`), and
+      the upstream base tag and SHA the candidate was built on
     - the version
     - the stamp script hash
     - the installer hash
     - the run ID.
 - **Publish job**, in order:
-  1. Push the candidate SHA to `jw` with an explicit expected-old-SHA lease.
-     If the lease fails, stop: `jw` moved during the run, so nothing gets
-     published.
-  2. Create the tag `vX.Y.Z-jw.N` on the candidate SHA, and create the
-     release as a draft bound to that tag.
-  3. Upload the installer, `.sig`, `latest.json` and `provenance.json`.
+  1. Create the tag `vX.Y.Z-jw.N` on `jw`'s head (`preRebaseHead`), a
+     commit already in the repo, through the API with `GITHUB_TOKEN`. A tag
+     that already points there, as on a resume, is accepted; one that
+     points elsewhere stops the run. Then create the release as a draft
+     bound to that tag. The tag marks the fork source; `provenance.json`
+     names the built candidate.
+  2. Upload the installer, `.sig`, `latest.json` and `provenance.json`.
      Download them back and re-verify the hashes and the signature.
-  4. Promote the release: not a draft, not a prerelease, `make_latest`.
-  5. Read the release back from the API, then fetch
+  3. Promote the release: not a draft, not a prerelease, `make_latest`.
+  4. Read the release back from the API, then fetch
      `releases/latest/download/latest.json` and check that it is this
      version.
 - **Run state and recovery:**
@@ -309,7 +321,8 @@ other than docs contains `cjpais/Handy/releases`.
   - A promote call that times out counts as unknown until the release has
     been read back.
   - If the public `latest.json` check fails after promotion, the run
-    publishes a fixed-forward `N+1` from the same candidate, and alerts.
+    fails and the next run publishes a fixed-forward `N+1` on the newer of
+    `fork/base.json` and the published release's base.
 - **Pinning and permissions:**
   - Third-party actions are pinned by commit SHA.
   - Permissions are set per job, because GitHub has no per-step
@@ -318,11 +331,8 @@ other than docs contains `cjpais/Handy/releases`.
     - admin: `actions: write`
     - sign: `contents: read` plus the `release` environment
     - publish: `contents: write`
-  - Pushes to `jw` and tag creation use `FORK_PUSH_TOKEN`, a fine-grained
-    PAT (Contents and Workflows read/write on jeremywho/Handy only) stored
-    in the GitHub environment `push`. `GITHUB_TOKEN` cannot push commits
-    that change workflow files, and rebases onto upstream produce them. The
-    push re-triggers the workflow; that run resolves to no-op.
+  - No personal access token. The only ref the workflow writes is the
+    release tag, on a commit already in the repo, with `GITHUB_TOKEN`.
 
 ### Fork setup order (once)
 
@@ -346,37 +356,20 @@ repository-level secret that `secrets: inherit` could pass on.
 - The updater key pair comes from `bun run tauri signer generate`.
 - The private key and password are secrets of the fork's `release`
   environment, used by the sign job only.
-- `FORK_PUSH_TOKEN` is a secret of the fork's `push` environment, used by
-  the publish job only, to push `jw` and the release tag.
 - A backup goes in Jeremy's 1Password vault "Private". The backup is checked
   once by signing a test file with it.
 - **Changing the key** (after a leak, or as a precaution):
   1. Generate a new pair.
   2. Ship a transition release signed with the old key that embeds the new
      `pubkey`.
-  3. Switch the sign job to the new key only after the Talon check confirms
-     the installed app is on that transition release.
+  3. Switch the sign job to the new key only after the installed app's
+     `DisplayVersion` shows that transition release.
 - **If the old key is lost,** Jeremy reinstalls once by hand.
 
 ### Monitoring
 
-- **Daily check on Talon:** a scheduled task reads run status with `gh` and
-  pushes through Home Assistant, as Jeremy's deal watches already do. It
-  alerts when:
-  - the workflow's last successful run is more than 36 hours old
-  - any run failed or stopped for review since the last check
-  - the installed app has been behind the latest fork release for more
-    than a day. It compares `DisplayVersion` under
-    `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy`, which
-    NSIS writes from the full version, with the release; the `handy.exe` file
-    version is always `0.9.8.0` and cannot tell fork releases apart. This
-    also catches a failed self-install that left Handy down or on an older
-    version.
-- **Why not rely on GitHub:** GitHub can delay or drop scheduled runs and
-  can disable them after 60 days without activity. GitHub's failure email
-  goes to whoever last edited the cron, so it is not relied on.
-- **Test the alert:** one forced failure at setup confirms the push actually
-  arrives.
+There is no separate monitor: GitHub's own failed-run emails and the
+Actions page are where failures show, and Jeremy judged a monitor overkill.
 
 ### In-app automatic update (carried change on `jw`)
 
@@ -420,8 +413,7 @@ headless or CLI mode), using `tauri-plugin-updater`'s Rust API:
   nothing if the installer fails or never launches.
   - The updater ignores the result of the launch call and exits anyway.
   - The design accepts manual recovery for that rare case rather than adding
-    a watchdog helper. The Talon check's version-lag alert is how Jeremy
-    finds out.
+    a watchdog helper.
 
 ### Switch-over from stock (once, by hand, guided)
 
@@ -463,8 +455,11 @@ fork replaces stock rather than installing alongside it.
 
 - Whether an update installed by the in-app updater shows a SmartScreen
   prompt for the unsigned installer.
-- Whether bot-only activity, meaning the workflow's own pushes and releases,
-  resets GitHub's 60-day schedule inactivity timer. The design does not rely
-  on it, because the Talon check covers it.
+- Whether the workflow's own releases reset GitHub's 60-day schedule
+  inactivity timer. If they do not, the schedule can be disabled with no
+  alert; a push to `jw` still runs the workflow.
+- Whether `GITHUB_TOKEN` can create the release tag on a `jw` head whose
+  commits change `.github/workflows/`. The first release that follows such
+  a push settles it.
 - Whether 2e3b3c0 applies cleanly to v0.9.8. If it does not, re-apply it by
   hand and re-run the same Windows verification that passed on `main`.
