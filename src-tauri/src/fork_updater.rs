@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(report(&fork_endpoints, FORK_PUBKEY)["ok"], true);
 
         let upstream = vec![
-            "https://github.com/cjpais/Handy/releases/latest/download/latest.json".to_string(),
+            "https://github.com/someone-else/Handy/releases/latest/download/latest.json".to_string(),
         ];
         assert_eq!(report(&upstream, FORK_PUBKEY)["ok"], false);
 

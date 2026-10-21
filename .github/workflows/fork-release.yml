@@ -348,6 +348,21 @@ jobs:
           Write-Host "HANDY_VC_REDIST_DIRS=$dirs"
           Add-Content -Path $env:GITHUB_ENV -Value "HANDY_VC_REDIST_DIRS=$dirs"
 
+      - name: Install ONNX Runtime (baseline, dynamic)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ORT_VERSION = "1.24.2"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-win-x64-$ORT_VERSION.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ort.zip"
+          $dist = Join-Path $env:RUNNER_TEMP "ort-dist"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dist -Force
+          $ortLib = (Resolve-Path (Join-Path $dist "onnxruntime-win-x64-$ORT_VERSION/lib")).Path
+          Write-Host "ORT_LIB_LOCATION=$ortLib"
+          Add-Content -Path $env:GITHUB_ENV -Value "ORT_LIB_LOCATION=$ortLib"
+          Add-Content -Path $env:GITHUB_ENV -Value "ORT_PREFER_DYNAMIC_LINK=1"
+
       - name: Install SPIRV-Headers for the transcribe-cpp Vulkan build
         shell: pwsh
         run: |
@@ -370,6 +385,9 @@ jobs:
 
       - name: Translation consistency
         run: bun run check:translations
+
+      - name: Model language coverage
+        run: bun run check:model-languages
 
       - name: Install Playwright browsers
         run: bunx playwright install chromium

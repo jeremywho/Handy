@@ -318,8 +318,11 @@ other than docs contains `cjpais/Handy/releases`.
     - admin: `actions: write`
     - sign: `contents: read` plus the `release` environment
     - publish: `contents: write`
-  - Pushes use `GITHUB_TOKEN`, so the workflow's own push to `jw` does not
-    trigger another run.
+  - Pushes to `jw` and tag creation use `FORK_PUSH_TOKEN`, a fine-grained
+    PAT (Contents and Workflows read/write on jeremywho/Handy only) stored
+    in the GitHub environment `push`. `GITHUB_TOKEN` cannot push commits
+    that change workflow files, and rebases onto upstream produce them. The
+    push re-triggers the workflow; that run resolves to no-op.
 
 ### Fork setup order (once)
 
@@ -343,6 +346,8 @@ repository-level secret that `secrets: inherit` could pass on.
 - The updater key pair comes from `bun run tauri signer generate`.
 - The private key and password are secrets of the fork's `release`
   environment, used by the sign job only.
+- `FORK_PUSH_TOKEN` is a secret of the fork's `push` environment, used by
+  the publish job only, to push `jw` and the release tag.
 - A backup goes in Jeremy's 1Password vault "Private". The backup is checked
   once by signing a test file with it.
 - **Changing the key** (after a leak, or as a precaution):
