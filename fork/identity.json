@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://github.com/jeremywho/Handy/releases/latest/download/latest.json",
+  "identifier": "com.pais.handy",
+  "productName": "Handy",
+  "publisher": "pais"
+}
