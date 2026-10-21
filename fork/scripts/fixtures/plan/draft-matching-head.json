@@ -12,7 +12,10 @@
     "jwHead": "2222222222222222222222222222222222222222",
     "latestPublished": {
       "version": "0.9.8-jw.2",
-      "sourceSha": "1111111111111111111111111111111111111111"
+      "sourceSha": "1111111111111111111111111111111111111111",
+      "preRebaseHead": "1111111111111111111111111111111111111111",
+      "baseTag": "v0.9.8",
+      "baseSha": "14f6f0d31cb22a4268acfbddba3052820fd0a06e"
     },
     "publicManifestVersion": "0.9.8-jw.2",
     "drafts": [

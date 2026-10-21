@@ -9,6 +9,7 @@ import {
   fetchWithRetry,
   formatOutputs,
   githubClient,
+  latestPublishedRelease,
   parseWorkflowChanges,
   uniqueTags,
 } from "./plan.mjs";
@@ -65,6 +66,10 @@ const RULE_FIXTURES = [
   ["rule 4: a broken public manifest builds N+1", "broken-public-manifest"],
   ["rule 4: a missing public manifest builds N+1", "missing-public-manifest"],
   [
+    "rule 4: a broken manifest after an in-runner rebase fixes forward on the published base",
+    "broken-manifest-after-rebased-release",
+  ],
+  [
     "rule 5: a new upstream that adds a workflow stops",
     "new-upstream-adds-workflow",
   ],
@@ -75,7 +80,15 @@ const RULE_FIXTURES = [
   ["rule 6: a new upstream rebases with N from 1", "new-upstream"],
   ["rule 7: a push to jw builds the next N", "jw-push"],
   ["rule 7: the first release builds jw.1", "first-release"],
-  ["rule 8: nothing changed is a no-op", "noop"],
+  [
+    "rule 7: an owner push after a rebased release rebases N+1 on the same upstream",
+    "owner-pushed-after-rebased-release",
+  ],
+  ["rule 8: an unchanged jw head and base is a no-op", "noop"],
+  [
+    "rule 8: an unchanged jw after an in-runner rebase is a no-op",
+    "unchanged-after-in-runner-rebase",
+  ],
   [
     "an upstream latest older than the base stops",
     "upstream-regressed-below-base",
@@ -240,6 +253,46 @@ test("an upstream regression below the base does not block resuming a draft", ()
     version: "0.9.8-jw.3",
     sourceSha: state.jwHead,
   });
+});
+
+test("noop keys on the published pre-rebase head, not its source SHA", () => {
+  const { state } = loadFixture("noop");
+  const decision = decide({
+    ...state,
+    latestPublished: {
+      ...state.latestPublished,
+      preRebaseHead: "2".repeat(40),
+    },
+  });
+  assert.deepEqual(decision, { action: "build", version: "0.9.8-jw.3" });
+});
+
+test("noop needs the published base to be upstream's latest", () => {
+  const { state } = loadFixture("noop");
+  const decision = decide({
+    ...state,
+    latestPublished: { ...state.latestPublished, baseSha: "5".repeat(40) },
+  });
+  assert.deepEqual(decision, { action: "build", version: "0.9.8-jw.3" });
+});
+
+test("a broken manifest fixes forward on fork/base.json when it is newer than the published base", () => {
+  const { state } = loadFixture("broken-manifest-after-rebased-release");
+  const decision = decide({
+    ...state,
+    base: { tag: "v0.9.10", sha: "9".repeat(39) + "2" },
+  });
+  assert.deepEqual(decision, { action: "build", version: "0.9.10-jw.1" });
+});
+
+test("a broken manifest whose published base tag is malformed stops", () => {
+  const { state } = loadFixture("broken-manifest-after-rebased-release");
+  const decision = decide({
+    ...state,
+    latestPublished: { ...state.latestPublished, baseTag: "main" },
+  });
+  assert.equal(decision.action, "stop");
+  assert.match(decision.reason, /main/);
 });
 
 test("rebaseChecks passes a clean rebase", () =>
@@ -555,4 +608,53 @@ test("apiList stops when a page repeats the previous page", async () => {
   const items = await github.apiList("/repos/x/y/releases");
   assert.equal(items.length, 100);
   assert.equal(calls.length, 2);
+});
+
+const PROVENANCE = {
+  version: "0.9.9-jw.1",
+  sourceSha: "c".repeat(40),
+  preRebaseHead: "1".repeat(40),
+  baseTag: "v0.9.9",
+  baseSha: "9".repeat(39) + "1",
+};
+
+function releaseRoute(provenance) {
+  return (url) => {
+    if (url.pathname === "/repos/jeremywho/Handy/releases/latest") {
+      return {
+        body: {
+          tag_name: "v0.9.9-jw.1",
+          assets: [{ id: 7, name: "provenance.json", state: "uploaded" }],
+        },
+      };
+    }
+    if (url.pathname === "/repos/jeremywho/Handy/releases/assets/7") {
+      return { body: provenance };
+    }
+    throw new Error(`unexpected ${url}`);
+  };
+}
+
+test("latestPublishedRelease returns the provenance fields decide() needs", async () => {
+  const { fetch } = routedFetch(releaseRoute(PROVENANCE));
+  const github = githubClient({ fetch, sleep: noSleep });
+  assert.deepEqual(await latestPublishedRelease(github), PROVENANCE);
+});
+
+for (const field of ["sourceSha", "preRebaseHead", "baseSha"]) {
+  test(`latestPublishedRelease throws when provenance lacks ${field}`, async () => {
+    const { fetch } = routedFetch(
+      releaseRoute({ ...PROVENANCE, [field]: undefined }),
+    );
+    const github = githubClient({ fetch, sleep: noSleep });
+    await assert.rejects(latestPublishedRelease(github), new RegExp(field));
+  });
+}
+
+test("latestPublishedRelease throws when provenance lacks a base tag", async () => {
+  const { fetch } = routedFetch(
+    releaseRoute({ ...PROVENANCE, baseTag: undefined }),
+  );
+  const github = githubClient({ fetch, sleep: noSleep });
+  await assert.rejects(latestPublishedRelease(github), /baseTag/);
 });

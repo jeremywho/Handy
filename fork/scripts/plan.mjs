@@ -101,11 +101,16 @@ export function decide(state) {
         `draft #${draft.id} has tag ${draft.tag}, expected vX.Y.Z-jw.N`,
       );
     }
-    return {
+    const resume = {
       action: "resume",
       draftId: draft.id,
       version: match[1],
       sourceSha: draft.sourceSha,
+    };
+    if (draft.sourceSha === jwHead) return resume;
+    return {
+      ...resume,
+      onto: { tag: upstreamLatest.tag, sha: upstreamLatest.sha },
     };
   }
 
@@ -113,6 +118,19 @@ export function decide(state) {
   const baseNumber = base.tag.slice(1);
 
   if (latestPublished && publicManifestVersion !== latestPublished.version) {
+    const publishedBase = releaseVersion(latestPublished.baseTag);
+    if (!publishedBase) {
+      return stop(
+        `latest published release ${latestPublished.version} has base tag ${latestPublished.baseTag}, expected vX.Y.Z`,
+      );
+    }
+    if (compareVersions(publishedBase, baseVersion) > 0) {
+      return {
+        action: "rebase",
+        onto: { tag: latestPublished.baseTag, sha: latestPublished.baseSha },
+        version: nextVersion(latestPublished.baseTag.slice(1), tags),
+      };
+    }
     return { action: "build", version: nextVersion(baseNumber, tags) };
   }
 
@@ -122,7 +140,8 @@ export function decide(state) {
     );
   }
 
-  if (compareVersions(upstreamVersion, baseVersion) > 0) {
+  const upstreamNewer = compareVersions(upstreamVersion, baseVersion) > 0;
+  if (upstreamNewer) {
     const added = upstreamWorkflowChanges?.added ?? [];
     if (added.length > 0) {
       return stop(
@@ -134,17 +153,24 @@ export function decide(state) {
         `upstream ${upstreamLatest.tag} touches ${FORK_RELEASE_WORKFLOW}; review before rebasing`,
       );
     }
+  }
+
+  if (
+    latestPublished &&
+    latestPublished.preRebaseHead === jwHead &&
+    latestPublished.baseSha === upstreamLatest.sha
+  ) {
+    return { action: "noop" };
+  }
+
+  if (upstreamNewer) {
     return {
       action: "rebase",
       onto: { tag: upstreamLatest.tag, sha: upstreamLatest.sha },
       version: nextVersion(upstreamLatest.tag.slice(1), tags),
     };
   }
-
-  if (!latestPublished || jwHead !== latestPublished.sourceSha) {
-    return { action: "build", version: nextVersion(baseNumber, tags) };
-  }
-  return { action: "noop" };
+  return { action: "build", version: nextVersion(baseNumber, tags) };
 }
 
 export function rebaseChecks({ mergesInRange, countBefore, countAfter }) {
@@ -367,14 +393,23 @@ async function readProvenance(github, release) {
   }
 }
 
-async function latestPublishedRelease(github) {
+export async function latestPublishedRelease(github) {
   const release = await github.api(`/repos/${FORK_REPO}/releases/latest`);
   if (!release) return null;
   const provenance = await readProvenance(github, release);
   const version = release.tag_name.replace(/^v/, "");
-  if (!provenance || !shaOrNull(provenance.sourceSha)) {
+  if (!provenance) {
     throw new Error(
-      `latest published release ${release.tag_name} has no readable ${PROVENANCE_ASSET} with a sourceSha`,
+      `latest published release ${release.tag_name} has no readable ${PROVENANCE_ASSET}`,
+    );
+  }
+  const missing = ["sourceSha", "preRebaseHead", "baseSha"].filter(
+    (field) => !shaOrNull(provenance[field]),
+  );
+  if (typeof provenance.baseTag !== "string") missing.push("baseTag");
+  if (missing.length > 0) {
+    throw new Error(
+      `latest published release ${release.tag_name} has a ${PROVENANCE_ASSET} without ${missing.join(", ")}`,
     );
   }
   if (provenance.version !== version) {
@@ -382,7 +417,13 @@ async function latestPublishedRelease(github) {
       `latest published release ${release.tag_name} has provenance version ${provenance.version}`,
     );
   }
-  return { version, sourceSha: provenance.sourceSha };
+  return {
+    version,
+    sourceSha: provenance.sourceSha,
+    preRebaseHead: provenance.preRebaseHead,
+    baseTag: provenance.baseTag,
+    baseSha: provenance.baseSha,
+  };
 }
 
 async function draftReleases(github, releases) {
