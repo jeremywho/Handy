@@ -1,0 +1,1025 @@
+name: "fork release"
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [jw]
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORK_REPO: jeremywho/Handy
+  UPSTREAM_REPO: cjpais/Handy
+  NODE_VERSION: "22"
+  SIGNER_VERSION: "2.11.4"
+  SIGNER_INTEGRITY: "sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ=="
+  SIGNER_LINUX_INTEGRITY: "sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ=="
+  BOT_NAME: "github-actions[bot]"
+  BOT_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
+
+jobs:
+  admin:
+    name: Disable other workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Disable every workflow except fork-release.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          self=".github/workflows/fork-release.yml"
+          list_workflows() {
+            gh api --paginate "repos/$REPO/actions/workflows" \
+              --jq '.workflows[] | [.id, .state, .path] | @tsv'
+          }
+          listing=$(list_workflows)
+          printf '%s\n' "$listing"
+          default_branch=$(gh api "repos/$REPO" --jq .default_branch)
+          if ! awk -F'\t' -v p="$self" '$3 == p { found = 1 } END { exit !found }' <<<"$listing"; then
+            if [ "$default_branch" = "jw" ]; then
+              echo "::error::$self is not in the workflow listing although jw is the default branch; the listing cannot be trusted"
+              exit 1
+            fi
+            echo "::warning::$self is not registered yet; workflows register from the default branch ($default_branch), not jw"
+          fi
+          failed=0
+          while IFS=$'\t' read -r id state path; do
+            [ -n "$id" ] || continue
+            [ "$path" = "$self" ] && continue
+            case "$state" in disabled_manually | deleted) continue ;; esac
+            if gh api --method PUT "repos/$REPO/actions/workflows/$id/disable" --silent; then
+              echo "disabled $path ($state)"
+            else
+              case "$path" in
+                dynamic/*) echo "::warning::could not disable GitHub-managed workflow $path ($state)" ;;
+                *) echo "::error::could not disable $path ($state)"; failed=1 ;;
+              esac
+            fi
+          done <<<"$listing"
+          [ "$failed" -eq 0 ] || exit 1
+          still_enabled=$(list_workflows | awk -F'\t' -v p="$self" \
+            '$3 != p && $3 !~ /^dynamic\// && $2 != "disabled_manually" && $2 != "deleted"')
+          if [ -n "$still_enabled" ]; then
+            echo "::error::workflows still enabled:"
+            printf '%s\n' "$still_enabled"
+            exit 1
+          fi
+
+  plan:
+    name: Plan
+    needs: admin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      draft_id: ${{ steps.plan.outputs.draft_id }}
+      jw_head: ${{ steps.plan.outputs.jw_head }}
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      base_tag: ${{ steps.candidate.outputs.base_tag }}
+      base_sha: ${{ steps.candidate.outputs.base_sha }}
+    steps:
+      - name: Check out the branch tip
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Decide
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node fork/scripts/plan.mjs
+
+      - name: Record the decision
+        env:
+          DECISION: ${{ steps.plan.outputs.decision }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          REASON: ${{ steps.plan.outputs.reason }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Plan: $ACTION"
+            echo
+            echo '```json'
+            printf '%s\n' "$DECISION"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          case "$ACTION" in
+            stop)
+              printf '**Stopped for review:** %s\n' "$REASON" >>"$GITHUB_STEP_SUMMARY"
+              echo "::error::stopped for review: $REASON"
+              exit 1
+              ;;
+            noop)
+              echo "Nothing to release: upstream equals fork/base.json and jw's head is the latest published source." >>"$GITHUB_STEP_SUMMARY"
+              ;;
+            resume | rebase | build)
+              if [ "$REF" != "refs/heads/jw" ]; then
+                echo "Ref $REF is not refs/heads/jw: this run tests and builds but does not publish." >>"$GITHUB_STEP_SUMMARY"
+              fi
+              echo "Event: $EVENT" >>"$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::unknown plan action '$ACTION'"
+              exit 1
+              ;;
+          esac
+
+      - name: Prepare the candidate
+        id: candidate
+        if: steps.plan.outputs.release == 'true'
+        env:
+          DECISION: ${{ steps.plan.outputs.decision }}
+          ACTION: ${{ steps.plan.outputs.action }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          JW_HEAD: ${{ steps.plan.outputs.jw_head }}
+          SOURCE_SHA: ${{ steps.plan.outputs.source_sha }}
+          ONTO_TAG: ${{ steps.plan.outputs.onto_tag }}
+          ONTO_SHA: ${{ steps.plan.outputs.onto_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; printf '**Stopped:** %s\n' "$1" >>"$GITHUB_STEP_SUMMARY"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$JW_HEAD" ] || fail "HEAD moved after planning"
+          tools="$RUNNER_TEMP/fork-scripts"
+          rm -rf "$tools"
+          mkdir -p "$tools"
+          cp -R fork/scripts/. "$tools/"
+
+          case "$ACTION" in
+            build)
+              candidate="$JW_HEAD"
+              ;;
+            resume)
+              if ! git cat-file -e "$SOURCE_SHA^{commit}" 2>/dev/null; then
+                git fetch --quiet origin "$SOURCE_SHA" || true
+              fi
+              git cat-file -e "$SOURCE_SHA^{commit}" 2>/dev/null \
+                || fail "the draft's source commit $SOURCE_SHA is not in the fork"
+              candidate="$SOURCE_SHA"
+              ;;
+            rebase)
+              old_tag=$(jq -r .tag fork/base.json)
+              old_sha=$(jq -r .sha fork/base.json)
+              git cat-file -e "$ONTO_SHA^{commit}" 2>/dev/null || fail "upstream $ONTO_TAG ($ONTO_SHA) was not fetched"
+              git merge-base --is-ancestor "$old_sha" "$JW_HEAD" || fail "base $old_tag ($old_sha) is not an ancestor of jw"
+              merges=$(git rev-list --merges --count "$old_sha..$JW_HEAD")
+              [ "$merges" -eq 0 ] || fail "jw has $merges merge commit(s) since $old_tag; rebase --onto would flatten them"
+              before=$(git rev-list --count "$old_sha..$JW_HEAD")
+              git checkout --quiet -B jw "$JW_HEAD"
+              if ! git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" rebase --onto "$ONTO_SHA" "$old_sha" jw; then
+                git status --short || true
+                git rebase --abort || true
+                fail "rebasing jw from $old_tag onto $ONTO_TAG conflicts; rebase by hand"
+              fi
+              after=$(git rev-list --count "$ONTO_SHA..jw")
+              node "$tools/plan.mjs" rebase-checks "$merges" "$before" "$after" \
+                || fail "rebase checks failed (merges $merges, commits before $before, after $after)"
+              jq --arg tag "$ONTO_TAG" --arg sha "$ONTO_SHA" '.tag = $tag | .sha = $sha' fork/base.json >"$RUNNER_TEMP/base.json"
+              mv "$RUNNER_TEMP/base.json" fork/base.json
+              git add fork/base.json
+              git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit --quiet -m "fork: base $ONTO_TAG"
+              candidate=$(git rev-parse HEAD)
+              {
+                echo "Rebased $before fork commit(s) from $old_tag onto $ONTO_TAG: $candidate"
+                if ! git diff --quiet "$old_sha" "$ONTO_SHA" -- .github/workflows/build.yml; then
+                  echo
+                  echo "### Upstream build.yml changed ($old_tag to $ONTO_TAG)"
+                  echo
+                  echo "The build and test jobs copy its Windows steps; bring over what applies."
+                  echo
+                  echo '```diff'
+                  git diff "$old_sha" "$ONTO_SHA" -- .github/workflows/build.yml
+                  echo '```'
+                fi
+              } >>"$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              fail "unexpected release action '$ACTION'"
+              ;;
+          esac
+
+          base_tag=$(git show "$candidate:fork/base.json" | jq -r .tag)
+          base_sha=$(git show "$candidate:fork/base.json" | jq -r .sha)
+          if [ "$ACTION" = "rebase" ]; then
+            [ "$base_sha" = "$ONTO_SHA" ] || fail "the candidate records base $base_sha, expected $ONTO_SHA"
+          fi
+          git merge-base --is-ancestor "$base_sha" "$candidate" || fail "base $base_tag ($base_sha) is not an ancestor of $candidate"
+
+          out="$RUNNER_TEMP/candidate"
+          mkdir -p "$out"
+          git branch --force candidate "$candidate"
+          git bundle create "$out/candidate.bundle" refs/heads/candidate
+          git bundle verify --quiet "$out/candidate.bundle"
+          jq -n \
+            --arg sha "$candidate" \
+            --arg version "$VERSION" \
+            --arg baseTag "$base_tag" \
+            --arg baseSha "$base_sha" \
+            --argjson decision "$DECISION" \
+            '{sha: $sha, version: $version, baseTag: $baseTag, baseSha: $baseSha, decision: $decision}' \
+            >"$out/candidate.json"
+          cat "$out/candidate.json"
+          {
+            echo "candidate_sha=$candidate"
+            echo "base_tag=$base_tag"
+            echo "base_sha=$base_sha"
+          } >>"$GITHUB_OUTPUT"
+          echo "Candidate $candidate, version $VERSION, base $base_tag ($base_sha)" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the candidate
+        if: steps.plan.outputs.release == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate
+          path: |
+            ${{ runner.temp }}/candidate/candidate.bundle
+            ${{ runner.temp }}/candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: Test (Windows x64)
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      stamp_hash: ${{ steps.stamp.outputs.stamp_hash }}
+    env:
+      CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_sha }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Unbundle and verify the candidate
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git fetch --quiet "$RUNNER_TEMP/candidate/candidate.bundle" "+refs/heads/candidate:refs/heads/candidate"
+          git checkout --quiet candidate
+          head=$(git rev-parse HEAD)
+          [ "$head" = "$CANDIDATE_SHA" ] || { echo "::error::HEAD is $head, expected $CANDIDATE_SHA"; exit 1; }
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Stamp the version
+        id: stamp
+        run: |
+          set -euo pipefail
+          hash=$(node fork/scripts/version.mjs stamp "$VERSION")
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::unexpected stamp output: $hash"; exit 1; }
+          echo "stamp_hash=$hash" >>"$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Locate VC++ runtime redist for app-local bundling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "vswhere found no Visual Studio installation" }
+          $versionFile = Join-Path $vsRoot "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
+          $redistVersion = (Get-Content $versionFile).Trim()
+          $archDir = Join-Path $vsRoot "VC\Redist\MSVC\$redistVersion\x64"
+          if (-not (Test-Path $archDir)) { throw "VC++ redist arch dir not found: $archDir" }
+          $crt = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.CRT" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $crt -or -not (Test-Path (Join-Path $crt.FullName "msvcp140.dll"))) {
+            throw "VC++ CRT redist dir not found or incomplete under: $archDir"
+          }
+          $omp = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.OpenMP" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $omp -or -not (Test-Path (Join-Path $omp.FullName "vcomp140.dll"))) {
+            throw "VC++ OpenMP redist dir not found or incomplete under: $archDir"
+          }
+          $dirs = "$($crt.FullName);$($omp.FullName)"
+          Write-Host "HANDY_VC_REDIST_DIRS=$dirs"
+          Add-Content -Path $env:GITHUB_ENV -Value "HANDY_VC_REDIST_DIRS=$dirs"
+
+      - name: Install SPIRV-Headers for the transcribe-cpp Vulkan build
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install spirv-headers failed" }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          $combined = if ($env:CMAKE_PREFIX_PATH) { "$prefix;$env:CMAKE_PREFIX_PATH" } else { $prefix }
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$combined"
+          Write-Host "CMAKE_PREFIX_PATH=$combined"
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Keyboard utility tests
+        run: bun run test:keyboard
+
+      - name: Translation consistency
+        run: bun run check:translations
+
+      - name: Install Playwright browsers
+        run: bunx playwright install chromium
+
+      - name: Playwright tests
+        run: bun run test:playwright
+
+      - name: Fork script tests
+        run: node --test "fork/scripts/*.test.mjs"
+
+  build:
+    name: Build (Windows x64 NSIS)
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      stamp_hash: ${{ steps.stamp.outputs.stamp_hash }}
+      installer_name: ${{ steps.installer.outputs.installer_name }}
+      installer_sha256: ${{ steps.installer.outputs.installer_sha256 }}
+    env:
+      CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_sha }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          git config --system core.longpaths true
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Unbundle and verify the candidate
+        run: |
+          set -euo pipefail
+          git init --quiet .
+          git fetch --quiet "$RUNNER_TEMP/candidate/candidate.bundle" "+refs/heads/candidate:refs/heads/candidate"
+          git checkout --quiet candidate
+          head=$(git rev-parse HEAD)
+          [ "$head" = "$CANDIDATE_SHA" ] || { echo "::error::HEAD is $head, expected $CANDIDATE_SHA"; exit 1; }
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Stamp the version
+        id: stamp
+        run: |
+          set -euo pipefail
+          hash=$(node fork/scripts/version.mjs stamp "$VERSION")
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::unexpected stamp output: $hash"; exit 1; }
+          echo "stamp_hash=$hash" >>"$GITHUB_OUTPUT"
+
+      - name: Check the effective config
+        run: node fork/scripts/check-config.mjs --version "$VERSION"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Locate VC++ runtime redist for app-local bundling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "vswhere found no Visual Studio installation" }
+          $versionFile = Join-Path $vsRoot "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
+          $redistVersion = (Get-Content $versionFile).Trim()
+          $archDir = Join-Path $vsRoot "VC\Redist\MSVC\$redistVersion\x64"
+          if (-not (Test-Path $archDir)) { throw "VC++ redist arch dir not found: $archDir" }
+          $crt = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.CRT" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $crt -or -not (Test-Path (Join-Path $crt.FullName "msvcp140.dll"))) {
+            throw "VC++ CRT redist dir not found or incomplete under: $archDir"
+          }
+          $omp = Get-ChildItem $archDir -Directory -Filter "Microsoft.VC*.OpenMP" |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $omp -or -not (Test-Path (Join-Path $omp.FullName "vcomp140.dll"))) {
+            throw "VC++ OpenMP redist dir not found or incomplete under: $archDir"
+          }
+          $dirs = "$($crt.FullName);$($omp.FullName)"
+          Write-Host "HANDY_VC_REDIST_DIRS=$dirs"
+          Add-Content -Path $env:GITHUB_ENV -Value "HANDY_VC_REDIST_DIRS=$dirs"
+
+      - name: Install ONNX Runtime (baseline, dynamic)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ORT_VERSION = "1.24.2"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-win-x64-$ORT_VERSION.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ort.zip"
+          $dist = Join-Path $env:RUNNER_TEMP "ort-dist"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dist -Force
+          $ortLib = (Resolve-Path (Join-Path $dist "onnxruntime-win-x64-$ORT_VERSION/lib")).Path
+          Write-Host "ORT_LIB_LOCATION=$ortLib"
+          Add-Content -Path $env:GITHUB_ENV -Value "ORT_LIB_LOCATION=$ortLib"
+          Add-Content -Path $env:GITHUB_ENV -Value "ORT_PREFER_DYNAMIC_LINK=1"
+
+      - name: Install SPIRV-Headers for the transcribe-cpp Vulkan build
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install spirv-headers failed" }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          $combined = if ($env:CMAKE_PREFIX_PATH) { "$prefix;$env:CMAKE_PREFIX_PATH" } else { $prefix }
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$combined"
+          Write-Host "CMAKE_PREFIX_PATH=$combined"
+
+      - name: Build the NSIS installer
+        run: bun run tauri build --bundles nsis --no-sign
+
+      - name: Check the staged runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staged = Get-ChildItem "src-tauri/transcribe-libs" -Filter "*.dll" -ErrorAction SilentlyContinue
+          if (-not $staged) { throw "src-tauri/transcribe-libs contains no DLLs" }
+          foreach ($name in @("msvcp140.dll", "vcruntime140.dll", "vcomp140.dll", "onnxruntime.dll")) {
+            if (-not ($staged | Where-Object { $_.Name -ieq $name })) { throw "Staging is missing $name" }
+          }
+          if (-not ($staged | Where-Object { $_.Name -like "*transcribe*" })) { throw "Staging is missing transcribe runtime DLLs" }
+          if (-not ($staged | Where-Object { $_.Name -like "*ggml*" })) { throw "Staging is missing ggml runtime DLLs" }
+          $staged | ForEach-Object { Write-Host "staged $($_.Name)" }
+
+      - name: Locate the installer
+        id: installer
+        run: |
+          set -euo pipefail
+          dir="src-tauri/target/release/bundle/nsis"
+          expected="Handy_${VERSION}_x64-setup.exe"
+          shopt -s nullglob
+          found=("$dir"/*.exe)
+          if [ "${#found[@]}" -ne 1 ] || [ "${found[0]}" != "$dir/$expected" ]; then
+            echo "::error::expected exactly $expected in $dir, found: ${found[*]:-nothing}"
+            exit 1
+          fi
+          sha=$(sha256sum "$dir/$expected" | cut -d' ' -f1)
+          out="$RUNNER_TEMP/installer"
+          mkdir -p "$out"
+          cp "$dir/$expected" "$out/"
+          printf '%s  %s\n' "$sha" "$expected" >"$out/$expected.sha256"
+          {
+            echo "installer_name=$expected"
+            echo "installer_sha256=$sha"
+          } >>"$GITHUB_OUTPUT"
+          echo "Installer $expected, SHA-256 $sha" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Check the installer identity
+        run: |
+          set -euo pipefail
+          nsi="src-tauri/target/release/nsis/x64/installer.nsi"
+          [ -f "$nsi" ] || { echo "::error::$nsi not found"; exit 1; }
+          for line in '!define MANUFACTURER "pais"' '!define PRODUCTNAME "Handy"' "!define VERSION \"$VERSION\""; do
+            if ! grep -qxF -- "$line" <(tr -d '\r' <"$nsi"); then
+              echo "::error::$nsi lacks: $line"
+              grep -nE '^!define (MANUFACTURER|PRODUCTNAME|VERSION) ' "$nsi" || true
+              exit 1
+            fi
+            echo "ok: $line"
+          done
+
+      - name: Extract handy.exe and run the fork self-test
+        shell: pwsh
+        env:
+          INSTALLER_NAME: ${{ steps.installer.outputs.installer_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP "installer/$env:INSTALLER_NAME"
+          $dir = Join-Path $env:RUNNER_TEMP "extracted"
+          & 7z x $installer "-o$dir" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z could not extract $installer (exit $LASTEXITCODE)" }
+          $exe = Join-Path $dir "handy.exe"
+          if (-not (Test-Path $exe)) { throw "handy.exe is not at the root of the extracted installer" }
+          foreach ($dll in Get-ChildItem "src-tauri/transcribe-libs" -Filter "*.dll") {
+            if (-not (Test-Path (Join-Path $dir $dll.Name))) { throw "the installer lacks staged runtime DLL $($dll.Name)" }
+          }
+
+          $negative = Start-Process -FilePath $exe -ArgumentList @("--fork-selftest", "`"$dir`"") -Wait -PassThru -NoNewWindow
+          if ($negative.ExitCode -ne 3) { throw "self-test into a directory exited $($negative.ExitCode), expected 3: the exit code cannot be trusted" }
+
+          $report = Join-Path $env:RUNNER_TEMP "selftest.json"
+          $run = Start-Process -FilePath $exe -ArgumentList @("--fork-selftest", "`"$report`"") -Wait -PassThru -NoNewWindow
+          if (Test-Path $report) { Get-Content $report -Raw | Write-Host }
+          if ($run.ExitCode -ne 0) { throw "handy.exe --fork-selftest exited $($run.ExitCode)" }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if ($result.ok -ne $true) { throw "self-test reported ok=$($result.ok)" }
+          $identity = Get-Content "fork/identity.json" -Raw | ConvertFrom-Json
+          $pubkey = (Get-Content "fork/updater.pub" -Raw).Trim()
+          if ($result.endpoint -ne $identity.endpoint) { throw "self-test endpoint $($result.endpoint), expected $($identity.endpoint)" }
+          if ($result.pubkey -ne $pubkey) { throw "self-test pubkey is not fork/updater.pub" }
+          Write-Host "self-test ok: $($result.endpoint)"
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installer
+          path: ${{ runner.temp }}/installer/
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    name: Sign and assemble
+    needs: [plan, build]
+    if: >-
+      needs.plan.outputs.release == 'true' &&
+      github.ref == 'refs/heads/jw' &&
+      contains('push schedule workflow_dispatch', github.event_name) &&
+      github.repository == 'jeremywho/Handy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      installer_name: ${{ needs.build.outputs.installer_name }}
+      installer_sha256: ${{ needs.build.outputs.installer_sha256 }}
+      stamp_hash: ${{ needs.build.outputs.stamp_hash }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_sha }}
+      JW_HEAD: ${{ needs.plan.outputs.jw_head }}
+      BASE_TAG: ${{ needs.plan.outputs.base_tag }}
+      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
+      STAMP_HASH: ${{ needs.build.outputs.stamp_hash }}
+      INSTALLER_NAME: ${{ needs.build.outputs.installer_name }}
+      INSTALLER_SHA256: ${{ needs.build.outputs.installer_sha256 }}
+    steps:
+      - name: Require the signing secrets
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEY" ] || [ -z "$PASSWORD" ]; then
+            echo "::error::release environment secrets missing (TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD in environment 'release')"
+            exit 1
+          fi
+
+      - name: Check out the fork scripts and public key
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.plan.outputs.jw_head }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            fork/scripts/
+            fork/updater.pub
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download the installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installer
+          path: ${{ runner.temp }}/dist
+
+      - name: Download the candidate record
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check the installer and the candidate record
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          ls -la "$dist"
+          [[ "$STAMP_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad stamp hash '$STAMP_HASH'"; exit 1; }
+          actual=$(sha256sum "$dist/$INSTALLER_NAME" | cut -d' ' -f1)
+          [ "$actual" = "$INSTALLER_SHA256" ] || { echo "::error::installer SHA-256 $actual, build reported $INSTALLER_SHA256"; exit 1; }
+          (cd "$dist" && sha256sum --check --strict "$INSTALLER_NAME.sha256")
+          rm "$dist/$INSTALLER_NAME.sha256"
+          record="$RUNNER_TEMP/candidate/candidate.json"
+          jq -e \
+            --arg sha "$CANDIDATE_SHA" --arg version "$VERSION" --arg baseTag "$BASE_TAG" --arg baseSha "$BASE_SHA" \
+            '.sha == $sha and .version == $version and .baseTag == $baseTag and .baseSha == $baseSha' \
+            "$record" >/dev/null || { echo "::error::candidate.json disagrees with the plan outputs"; cat "$record"; exit 1; }
+
+      - name: Install the pinned Tauri signer
+        run: |
+          set -euo pipefail
+          signer="$RUNNER_TEMP/signer"
+          mkdir -p "$signer"
+          cd "$signer"
+          printf '{"private":true}\n' >package.json
+          npm i --no-save --ignore-scripts --no-audit --no-fund "@tauri-apps/cli@$SIGNER_VERSION"
+          lock="node_modules/.package-lock.json"
+          jq -e --arg i "$SIGNER_INTEGRITY" '.packages["node_modules/@tauri-apps/cli"].integrity == $i' "$lock" >/dev/null \
+            || { echo "::error::@tauri-apps/cli integrity does not match the pinned value"; exit 1; }
+          jq -e --arg i "$SIGNER_LINUX_INTEGRITY" '.packages["node_modules/@tauri-apps/cli-linux-x64-gnu"].integrity == $i' "$lock" >/dev/null \
+            || { echo "::error::@tauri-apps/cli-linux-x64-gnu integrity does not match the pinned value"; exit 1; }
+          version=$(node_modules/.bin/tauri --version)
+          [ "$version" = "tauri-cli $SIGNER_VERSION" ] || { echo "::error::signer reports '$version'"; exit 1; }
+
+      - name: Sign the installer for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/signer/node_modules/.bin/tauri" signer sign "$RUNNER_TEMP/dist/$INSTALLER_NAME"
+          [ -s "$RUNNER_TEMP/dist/$INSTALLER_NAME.sig" ] || { echo "::error::no signature written"; exit 1; }
+
+      - name: Verify the signature against fork/updater.pub
+        run: node trusted/fork/scripts/verify-sig.mjs "$RUNNER_TEMP/dist/$INSTALLER_NAME" "$RUNNER_TEMP/dist/$INSTALLER_NAME.sig" trusted/fork/updater.pub
+
+      - name: Check that upstream's signature fails against the fork key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/stock"
+          mkdir -p "$work"
+          tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          curl -fsSL --retry 3 -o "$work/latest.json" "https://github.com/$UPSTREAM_REPO/releases/download/$tag/latest.json"
+          if jq -e '.platforms["windows-x86_64-nsis"]' "$work/latest.json" >/dev/null; then
+            entry="windows-x86_64-nsis"
+          else
+            entry="windows-x86_64"
+          fi
+          url=$(jq -er --arg e "$entry" '.platforms[$e].url' "$work/latest.json")
+          jq -er --arg e "$entry" '.platforms[$e].signature' "$work/latest.json" >"$work/stock.sig"
+          echo "Upstream $tag: checking the $entry entry, $url"
+          curl -fsSL --retry 3 -o "$work/stock-installer" "$url"
+          curl -fsSL --retry 3 "https://raw.githubusercontent.com/$UPSTREAM_REPO/$tag/src-tauri/tauri.conf.json" \
+            | jq -er '.plugins.updater.pubkey' >"$work/upstream.pub"
+          if ! node trusted/fork/scripts/verify-sig.mjs "$work/stock-installer" "$work/stock.sig" "$work/upstream.pub"; then
+            echo "::error::upstream's $entry signature does not verify against upstream's own key; the negative check below would prove nothing"
+            exit 1
+          fi
+          set +e
+          node trusted/fork/scripts/verify-sig.mjs "$work/stock-installer" "$work/stock.sig" trusted/fork/updater.pub
+          rc=$?
+          set -e
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::verify-sig exited $rc for upstream's $entry signature against the fork key, expected 1"
+            exit 1
+          fi
+          echo "Stock rejection: upstream $tag $entry verifies with upstream's key and fails with the fork's key." >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Build latest.json
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          node trusted/fork/scripts/manifest.mjs "$VERSION" "$dist/$INSTALLER_NAME" "$dist/$INSTALLER_NAME.sig" >"$dist/latest.json"
+          cat "$dist/latest.json"
+          url="https://github.com/$FORK_REPO/releases/download/v$VERSION/$INSTALLER_NAME"
+          jq -e --arg v "$VERSION" --arg u "$url" \
+            '.version == $v and ([.platforms[].url] | unique) == [$u]' "$dist/latest.json" >/dev/null \
+            || { echo "::error::latest.json does not carry version $VERSION and url $url"; exit 1; }
+
+      - name: Write provenance.json
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg version "$VERSION" \
+            --arg sourceSha "$CANDIDATE_SHA" \
+            --arg preRebaseHead "$JW_HEAD" \
+            --arg baseTag "$BASE_TAG" \
+            --arg baseSha "$BASE_SHA" \
+            --arg stampHash "$STAMP_HASH" \
+            --arg installerSha256 "$INSTALLER_SHA256" \
+            --argjson runId "$RUN_ID" \
+            '{version: $version, sourceSha: $sourceSha, preRebaseHead: $preRebaseHead, baseTag: $baseTag, baseSha: $baseSha, stampHash: $stampHash, installerSha256: $installerSha256, runId: $runId}' \
+            >"$RUNNER_TEMP/dist/provenance.json"
+          cat "$RUNNER_TEMP/dist/provenance.json"
+
+      - name: Upload the release set
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-set
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: [plan, test, sign]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: push
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      ACTION: ${{ needs.plan.outputs.action }}
+      DRAFT_ID: ${{ needs.plan.outputs.draft_id }}
+      CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_sha }}
+      JW_HEAD: ${{ needs.plan.outputs.jw_head }}
+      INSTALLER_NAME: ${{ needs.sign.outputs.installer_name }}
+      INSTALLER_SHA256: ${{ needs.sign.outputs.installer_sha256 }}
+    steps:
+      - name: Check the test and build stamps agree
+        env:
+          TEST_STAMP: ${{ needs.test.outputs.stamp_hash }}
+          BUILD_STAMP: ${{ needs.sign.outputs.stamp_hash }}
+        run: |
+          if [ -z "$TEST_STAMP" ] || [ "$TEST_STAMP" != "$BUILD_STAMP" ]; then
+            echo "::error::test stamped with '$TEST_STAMP', build with '$BUILD_STAMP'"
+            exit 1
+          fi
+
+      - name: Check out the fork scripts and public key
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.plan.outputs.jw_head }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            fork/scripts/
+            fork/updater.pub
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download the release set
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-set
+          path: ${{ runner.temp }}/dist
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check the release set
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          ls -la "$dist"
+          actual=$(sha256sum "$dist/$INSTALLER_NAME" | cut -d' ' -f1)
+          [ "$actual" = "$INSTALLER_SHA256" ] || { echo "::error::installer SHA-256 $actual, expected $INSTALLER_SHA256"; exit 1; }
+          node trusted/fork/scripts/verify-sig.mjs "$dist/$INSTALLER_NAME" "$dist/$INSTALLER_NAME.sig" trusted/fork/updater.pub
+          jq -e --arg v "$VERSION" --arg s "$CANDIDATE_SHA" --arg h "$INSTALLER_SHA256" --arg p "$JW_HEAD" \
+            '.version == $v and .sourceSha == $s and .installerSha256 == $h and .preRebaseHead == $p' \
+            "$dist/provenance.json" >/dev/null || { echo "::error::provenance.json disagrees with this run"; exit 1; }
+          jq -e --arg v "$VERSION" '.version == $v' "$dist/latest.json" >/dev/null \
+            || { echo "::error::latest.json is not version $VERSION"; exit 1; }
+
+      - name: Unbundle and verify the candidate
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/repo"
+          git init --quiet "$repo"
+          git -C "$repo" fetch --quiet "$RUNNER_TEMP/candidate/candidate.bundle" "+refs/heads/candidate:refs/heads/candidate"
+          head=$(git -C "$repo" rev-parse refs/heads/candidate)
+          [ "$head" = "$CANDIDATE_SHA" ] || { echo "::error::bundle head is $head, expected $CANDIDATE_SHA"; exit 1; }
+
+      - name: Push jw to the candidate
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$FORK_PUSH_TOKEN" ] || { echo "::error::push environment secret FORK_PUSH_TOKEN missing"; exit 1; }
+          remote="https://github.com/$FORK_REPO.git"
+          current=$(git ls-remote "$remote" refs/heads/jw | cut -f1)
+          if [ "$current" = "$CANDIDATE_SHA" ]; then
+            echo "jw is already at $CANDIDATE_SHA"
+            exit 0
+          fi
+          if [ "$current" != "$JW_HEAD" ]; then
+            echo "::error::jw is at ${current:-nothing}, but this run planned from $JW_HEAD; jw moved during the run"
+            exit 1
+          fi
+          git -C "$RUNNER_TEMP/repo" \
+            -c credential.helper= \
+            -c "credential.helper=!f() { echo username=x-access-token; echo password=\$FORK_PUSH_TOKEN; }; f" \
+            push --force-with-lease="refs/heads/jw:$JW_HEAD" "$remote" "$CANDIDATE_SHA:refs/heads/jw"
+          echo "Pushed jw: $JW_HEAD -> $CANDIDATE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Tag the candidate
+        env:
+          FORK_PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          remote="https://github.com/$FORK_REPO.git"
+          tag="v$VERSION"
+          refs=$(git ls-remote "$remote" "refs/tags/$tag" "refs/tags/$tag^{}")
+          if [ -n "$refs" ]; then
+            peeled=$(awk -v t="refs/tags/$tag^{}" '$2 == t { print $1 }' <<<"$refs")
+            [ -n "$peeled" ] || peeled=$(awk -v t="refs/tags/$tag" '$2 == t { print $1 }' <<<"$refs")
+            if [ "$peeled" != "$CANDIDATE_SHA" ]; then
+              echo "::error::tag $tag exists at $peeled, not the candidate $CANDIDATE_SHA"
+              exit 1
+            fi
+            echo "tag $tag already points at the candidate"
+            exit 0
+          fi
+          git -C "$RUNNER_TEMP/repo" \
+            -c credential.helper= \
+            -c "credential.helper=!f() { echo username=x-access-token; echo password=\$FORK_PUSH_TOKEN; }; f" \
+            push "$remote" "$CANDIDATE_SHA:refs/tags/$tag"
+
+      - name: Create or reuse the draft release
+        id: draft
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if [ -n "$DRAFT_ID" ]; then
+            release=$(gh api "repos/$FORK_REPO/releases/$DRAFT_ID")
+            jq -e --arg t "$tag" '.draft == true and .tag_name == $t' <<<"$release" >/dev/null \
+              || { echo "::error::release $DRAFT_ID is no longer a draft for $tag"; exit 1; }
+            release_id="$DRAFT_ID"
+            while IFS=$'\t' read -r asset_id name; do
+              [ -n "$asset_id" ] || continue
+              gh api --method DELETE "repos/$FORK_REPO/releases/assets/$asset_id" --silent
+              echo "deleted earlier draft asset $name"
+            done < <(jq -r '.assets[] | [.id, .name] | @tsv' <<<"$release")
+          else
+            release_id=$(gh api --method POST "repos/$FORK_REPO/releases" \
+              -f tag_name="$tag" \
+              -f name="$tag" \
+              -f body="Built from $CANDIDATE_SHA by $RUN_URL" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq .id)
+          fi
+          echo "release_id=$release_id" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the release assets
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          for name in provenance.json "$INSTALLER_NAME" "$INSTALLER_NAME.sig" latest.json; do
+            curl --fail-with-body -sS -o /dev/null \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$dist/$name" \
+              "https://uploads.github.com/repos/$FORK_REPO/releases/$RELEASE_ID/assets?name=$name"
+            echo "uploaded $name"
+          done
+
+      - name: Download the assets back and verify them
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/dist"
+          back="$RUNNER_TEMP/back"
+          mkdir -p "$back"
+          release=$(gh api "repos/$FORK_REPO/releases/$RELEASE_ID")
+          expected=$(printf '%s\n' latest.json provenance.json "$INSTALLER_NAME" "$INSTALLER_NAME.sig" | sort)
+          listed=$(jq -r '.assets[] | select(.state == "uploaded") | .name' <<<"$release" | sort)
+          all=$(jq -r '.assets[].name' <<<"$release" | sort)
+          if [ "$listed" != "$expected" ] || [ "$all" != "$expected" ]; then
+            echo "::error::release assets are"
+            printf '%s\n' "$all"
+            exit 1
+          fi
+          while IFS=$'\t' read -r asset_id name; do
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o "$back/$name" \
+              "https://api.github.com/repos/$FORK_REPO/releases/assets/$asset_id"
+            cmp "$dist/$name" "$back/$name" || { echo "::error::$name differs after upload"; exit 1; }
+            echo "verified $name"
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' <<<"$release")
+          actual=$(sha256sum "$back/$INSTALLER_NAME" | cut -d' ' -f1)
+          [ "$actual" = "$INSTALLER_SHA256" ] || { echo "::error::downloaded installer SHA-256 $actual"; exit 1; }
+          node trusted/fork/scripts/verify-sig.mjs "$back/$INSTALLER_NAME" "$back/$INSTALLER_NAME.sig" trusted/fork/updater.pub
+          sig=$(tr -d '\r\n' <"$back/$INSTALLER_NAME.sig")
+          url="https://github.com/$FORK_REPO/releases/download/v$VERSION/$INSTALLER_NAME"
+          jq -e --arg v "$VERSION" --arg u "$url" --arg s "$sig" \
+            '.version == $v and ([.platforms[] | [.url, .signature]] | unique) == [[$u, $s]]' \
+            "$back/latest.json" >/dev/null || { echo "::error::downloaded latest.json does not match"; exit 1; }
+
+      - name: Promote the release
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method PATCH "repos/$FORK_REPO/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true \
+            --silent; then
+            echo "::warning::the promote call failed or timed out; the read-back decides"
+          fi
+
+      - name: Read the release back
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          for attempt in 1 2 3 4 5 6; do
+            release=$(gh api "repos/$FORK_REPO/releases/$RELEASE_ID" || true)
+            latest=$(gh api "repos/$FORK_REPO/releases/latest" --jq .id || true)
+            if jq -e --arg t "$tag" '.draft == false and .prerelease == false and .tag_name == $t' <<<"${release:-null}" >/dev/null 2>&1 \
+              && [ "$latest" = "$RELEASE_ID" ]; then
+              echo "release $RELEASE_ID ($tag) is published and latest"
+              exit 0
+            fi
+            echo "attempt $attempt: not yet published as latest (latest is ${latest:-unknown})"
+            sleep 5
+          done
+          echo "::error::release $RELEASE_ID ($tag) is not the published latest release"
+          exit 1
+
+      - name: Check the public latest.json
+        run: |
+          set -euo pipefail
+          manifest_url="https://github.com/$FORK_REPO/releases/latest/download/latest.json"
+          asset_url="https://github.com/$FORK_REPO/releases/download/v$VERSION/$INSTALLER_NAME"
+          seen=""
+          for attempt in $(seq 1 12); do
+            seen=$(curl -fsSL --max-time 15 -H "Cache-Control: no-cache" "$manifest_url" | jq -r .version 2>/dev/null || true)
+            if [ "$seen" = "$VERSION" ]; then
+              curl -fsSL --max-time 60 -o /dev/null -r 0-0 "$asset_url"
+              echo "Published $VERSION: $manifest_url serves it and $asset_url resolves." >>"$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt $attempt: public latest.json version is '${seen:-unreadable}'"
+            sleep 10
+          done
+          echo "::error::$manifest_url still serves '${seen:-nothing}' after promotion; the next run cuts a fixed-forward release"
+          exit 1
