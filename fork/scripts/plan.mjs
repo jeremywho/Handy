@@ -79,11 +79,6 @@ export function decide(state) {
   if (!upstreamVersion) {
     return stop(`upstream latest tag ${upstreamLatest.tag} is not vX.Y.Z`);
   }
-  if (compareVersions(upstreamVersion, baseVersion) < 0) {
-    return stop(
-      `upstream latest ${upstreamLatest.tag} is older than the base ${base.tag}`,
-    );
-  }
 
   if (drafts.length > 0) {
     const stale = drafts.filter(
@@ -119,6 +114,12 @@ export function decide(state) {
 
   if (latestPublished && publicManifestVersion !== latestPublished.version) {
     return { action: "build", version: nextVersion(baseNumber, tags) };
+  }
+
+  if (compareVersions(upstreamVersion, baseVersion) < 0) {
+    return stop(
+      `upstream latest ${upstreamLatest.tag} is older than the base ${base.tag}`,
+    );
   }
 
   if (compareVersions(upstreamVersion, baseVersion) > 0) {

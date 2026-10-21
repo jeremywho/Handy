@@ -80,6 +80,10 @@ const RULE_FIXTURES = [
     "an upstream latest older than the base stops",
     "upstream-regressed-below-base",
   ],
+  [
+    "rule 4: a broken public manifest builds N+1 even when upstream regressed",
+    "upstream-regressed-broken-manifest",
+  ],
 ];
 
 for (const [title, name] of RULE_FIXTURES) {
@@ -220,7 +224,7 @@ test("upstream newer compares numerically, not as strings", () => {
   });
 });
 
-test("an upstream regression below the base stops before resuming a draft", () => {
+test("an upstream regression below the base does not block resuming a draft", () => {
   const { state } = loadFixture("draft-matching-head");
   const decision = decide({
     ...state,
@@ -230,7 +234,12 @@ test("an upstream regression below the base stops before resuming a draft", () =
       confVersion: "0.9.7",
     },
   });
-  assert.equal(decision.action, "stop");
+  assert.deepEqual(decision, {
+    action: "resume",
+    draftId: 202,
+    version: "0.9.8-jw.3",
+    sourceSha: state.jwHead,
+  });
 });
 
 test("rebaseChecks passes a clean rebase", () =>
