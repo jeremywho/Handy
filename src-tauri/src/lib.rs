@@ -10,6 +10,7 @@ mod chinese_script;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod fork_updater;
 mod helpers;
 mod input;
 mod llm_client;
@@ -839,6 +840,7 @@ pub fn run(cli_args: CliArgs) {
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
             helpers::clamshell::is_laptop,
+            fork_updater::install_update_now,
         ])
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
@@ -873,8 +875,10 @@ pub fn run(cli_args: CliArgs) {
 
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
-    let headless_mode =
-        cli_args.transcribe_file.is_some() || cli_args.list_devices || cli_args.list_models;
+    let headless_mode = cli_args.transcribe_file.is_some()
+        || cli_args.list_devices
+        || cli_args.list_models
+        || cli_args.fork_selftest.is_some();
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
@@ -996,6 +1000,13 @@ pub fn run(cli_args: CliArgs) {
             // signal handlers, and autostart that initialize_core_logic sets up.
             if headless_mode {
                 let app_handle = app.handle().clone();
+                if let Some(path) = cli_args.fork_selftest.as_deref() {
+                    let code = fork_updater::write_selftest(&app_handle, path);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
+                    std::process::exit(code);
+                }
                 let model_manager = Arc::new(
                     ModelManager::new(&app_handle).expect("Failed to initialize model manager"),
                 );

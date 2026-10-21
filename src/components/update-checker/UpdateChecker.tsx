@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { arch, platform } from "@tauri-apps/plugin-os";
-import { ProgressBar } from "../shared";
 import { useSettings } from "../../hooks/useSettings";
 import { commands } from "../../bindings";
 import {
@@ -23,7 +21,6 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const [isChecking, setIsChecking] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [isInstalling, setIsInstalling] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
   const [showUpToDate, setShowUpToDate] = useState(false);
   const [showPortableUpdateDialog, setShowPortableUpdateDialog] =
     useState(false);
@@ -44,8 +41,6 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
   const upToDateTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const isManualCheckRef = useRef(false);
-  const downloadedBytesRef = useRef(0);
-  const contentLengthRef = useRef(0);
 
   useEffect(() => {
     // Wait for settings to load before doing anything
@@ -130,43 +125,16 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
     try {
       setIsInstalling(true);
-      setDownloadProgress(0);
-      downloadedBytesRef.current = 0;
-      contentLengthRef.current = 0;
-      const update = await check();
-
-      if (!update) {
-        console.log("No update available during install attempt");
-        return;
+      const result = await commands.installUpdateNow();
+      if (result.status === "ok") {
+        setUpdateAvailable(false);
+      } else {
+        console.error("Failed to install update:", result.error);
       }
-
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            downloadedBytesRef.current = 0;
-            contentLengthRef.current = event.data.contentLength ?? 0;
-            break;
-          case "Progress":
-            downloadedBytesRef.current += event.data.chunkLength;
-            const progress =
-              contentLengthRef.current > 0
-                ? Math.round(
-                    (downloadedBytesRef.current / contentLengthRef.current) *
-                      100,
-                  )
-                : 0;
-            setDownloadProgress(Math.min(progress, 100));
-            break;
-        }
-      });
-      await relaunch();
     } catch (error) {
       console.error("Failed to install update:", error);
     } finally {
       setIsInstalling(false);
-      setDownloadProgress(0);
-      downloadedBytesRef.current = 0;
-      contentLengthRef.current = 0;
     }
   };
 
@@ -175,15 +143,7 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
     if (!updateChecksEnabled) {
       return t("footer.updateCheckingDisabled");
     }
-    if (isInstalling) {
-      return downloadProgress > 0 && downloadProgress < 100
-        ? t("footer.downloading", {
-            progress: downloadProgress.toString().padStart(3),
-          })
-        : downloadProgress === 100
-          ? t("footer.installing")
-          : t("footer.preparing");
-    }
+    if (isInstalling) return t("footer.installing");
     if (isChecking) return t("footer.checkingUpdates");
     if (showUpToDate) return t("footer.upToDate");
     if (updateAvailable) return t("footer.updateAvailableShort");
@@ -258,18 +218,6 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
           <span className="text-text/60 tabular-nums">
             {getUpdateStatusText()}
           </span>
-        )}
-
-        {isInstalling && downloadProgress > 0 && downloadProgress < 100 && (
-          <ProgressBar
-            progress={[
-              {
-                id: "update",
-                percentage: downloadProgress,
-              },
-            ]}
-            size="large"
-          />
         )}
       </div>
     </>

@@ -60,4 +60,9 @@ pub struct CliArgs {
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Write the updater endpoint and key report as JSON to PATH and exit.
+    /// Exits 0 when the build trusts only the fork's endpoint and key, 3 otherwise.
+    #[arg(long, value_name = "PATH")]
+    pub fork_selftest: Option<PathBuf>,
 }
