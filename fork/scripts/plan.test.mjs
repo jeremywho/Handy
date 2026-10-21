@@ -26,6 +26,9 @@ const STOP_REASONS = {
   retagged: /v0\.9\.8/,
   "stale-draft-plus-new-upstream": /stale draft.*301.*v0\.9\.9-jw\.1/,
   "draft-without-provenance": /stale draft.*305/,
+  "upstream-regressed-below-published-base": /v0\.9\.9.*v0\.9\.8.*v0\.9\.10/,
+  "upstream-regressed-to-base-json": /v0\.9\.8 is older.*v0\.9\.8.*v0\.9\.10/,
+  "published-base-retagged": /re-tagged v0\.9\.9.*9{39}1/,
 };
 
 function checkFixture(name) {
@@ -96,6 +99,18 @@ const RULE_FIXTURES = [
   [
     "rule 4: a broken public manifest builds N+1 even when upstream regressed",
     "upstream-regressed-broken-manifest",
+  ],
+  [
+    "an upstream latest older than the published base stops",
+    "upstream-regressed-below-published-base",
+  ],
+  [
+    "an upstream latest back at fork/base.json but below the published base stops",
+    "upstream-regressed-to-base-json",
+  ],
+  [
+    "an upstream latest tag that is the published base on another SHA stops",
+    "published-base-retagged",
   ],
 ];
 
@@ -226,7 +241,13 @@ test("upstream newer compares numerically, not as strings", () => {
       sha: "7".repeat(40),
       confVersion: "0.9.10",
     },
-    latestPublished: { version: "0.9.9-jw.1", sourceSha: state.jwHead },
+    latestPublished: {
+      version: "0.9.9-jw.1",
+      sourceSha: state.jwHead,
+      preRebaseHead: state.jwHead,
+      baseTag: "v0.9.9",
+      baseSha: "8".repeat(40),
+    },
     publicManifestVersion: "0.9.9-jw.1",
     forkTags: ["v0.9.9-jw.1"],
   });
@@ -271,9 +292,23 @@ test("noop needs the published base to be upstream's latest", () => {
   const { state } = loadFixture("noop");
   const decision = decide({
     ...state,
-    latestPublished: { ...state.latestPublished, baseSha: "5".repeat(40) },
+    latestPublished: {
+      ...state.latestPublished,
+      baseTag: "v0.9.7",
+      baseSha: "5".repeat(40),
+    },
   });
   assert.deepEqual(decision, { action: "build", version: "0.9.8-jw.3" });
+});
+
+test("a published base on another SHA under upstream's tag stops as re-tagged, not noop or build", () => {
+  const { state } = loadFixture("noop");
+  const decision = decide({
+    ...state,
+    latestPublished: { ...state.latestPublished, baseSha: "5".repeat(40) },
+  });
+  assert.equal(decision.action, "stop");
+  assert.match(decision.reason, /re-tagged v0\.9\.8/);
 });
 
 test("a broken manifest fixes forward on fork/base.json when it is newer than the published base", () => {
@@ -287,6 +322,29 @@ test("a broken manifest fixes forward on fork/base.json when it is newer than th
 
 test("a broken manifest whose published base tag is malformed stops", () => {
   const { state } = loadFixture("broken-manifest-after-rebased-release");
+  const decision = decide({
+    ...state,
+    latestPublished: { ...state.latestPublished, baseTag: "main" },
+  });
+  assert.equal(decision.action, "stop");
+  assert.match(decision.reason, /main/);
+});
+
+test("upstream still at a published base above fork/base.json is a no-op", () => {
+  const { state } = loadFixture("upstream-regressed-below-published-base");
+  const decision = decide({
+    ...state,
+    upstreamLatest: {
+      tag: "v0.9.10",
+      sha: "9".repeat(39) + "2",
+      confVersion: "0.9.10",
+    },
+  });
+  assert.deepEqual(decision, { action: "noop" });
+});
+
+test("a published base tag that is not vX.Y.Z stops even with a healthy manifest", () => {
+  const { state } = loadFixture("noop");
   const decision = decide({
     ...state,
     latestPublished: { ...state.latestPublished, baseTag: "main" },

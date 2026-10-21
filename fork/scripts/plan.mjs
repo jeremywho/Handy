@@ -117,26 +117,47 @@ export function decide(state) {
   const tags = uniqueTags(forkTags);
   const baseNumber = base.tag.slice(1);
 
+  const publishedBaseVersion =
+    latestPublished && releaseVersion(latestPublished.baseTag);
+  if (latestPublished && !publishedBaseVersion) {
+    return stop(
+      `latest published release ${latestPublished.version} has base tag ${latestPublished.baseTag}, expected vX.Y.Z`,
+    );
+  }
+  const publishedBaseIsNewer =
+    publishedBaseVersion &&
+    compareVersions(publishedBaseVersion, baseVersion) > 0;
+  const effective = publishedBaseIsNewer
+    ? {
+        tag: latestPublished.baseTag,
+        sha: latestPublished.baseSha,
+        version: publishedBaseVersion,
+      }
+    : { tag: base.tag, sha: base.sha, version: baseVersion };
+
   if (latestPublished && publicManifestVersion !== latestPublished.version) {
-    const publishedBase = releaseVersion(latestPublished.baseTag);
-    if (!publishedBase) {
-      return stop(
-        `latest published release ${latestPublished.version} has base tag ${latestPublished.baseTag}, expected vX.Y.Z`,
-      );
-    }
-    if (compareVersions(publishedBase, baseVersion) > 0) {
+    if (publishedBaseIsNewer) {
       return {
         action: "rebase",
-        onto: { tag: latestPublished.baseTag, sha: latestPublished.baseSha },
-        version: nextVersion(latestPublished.baseTag.slice(1), tags),
+        onto: { tag: effective.tag, sha: effective.sha },
+        version: nextVersion(effective.tag.slice(1), tags),
       };
     }
     return { action: "build", version: nextVersion(baseNumber, tags) };
   }
 
-  if (compareVersions(upstreamVersion, baseVersion) < 0) {
+  if (compareVersions(upstreamVersion, effective.version) < 0) {
     return stop(
-      `upstream latest ${upstreamLatest.tag} is older than the base ${base.tag}`,
+      `upstream latest ${upstreamLatest.tag} is older than the base ${effective.tag} (fork/base.json ${base.tag}, published base ${latestPublished?.baseTag ?? "none"})`,
+    );
+  }
+  if (
+    latestPublished &&
+    upstreamLatest.tag === latestPublished.baseTag &&
+    upstreamLatest.sha !== latestPublished.baseSha
+  ) {
+    return stop(
+      `upstream re-tagged ${latestPublished.baseTag}: it peels to ${upstreamLatest.sha}, but the latest published release was built on ${latestPublished.baseSha}`,
     );
   }
 
