@@ -1,9 +1,10 @@
+use std::convert::Infallible;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, Url};
@@ -29,6 +30,19 @@ pub enum Step {
     WaitInterval,
     PollIdle,
     Install,
+    Recheck,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    Deferred,
+    Failed(String),
+}
+
+impl Attempt {
+    fn ends_cycle(&self) -> bool {
+        matches!(self, Attempt::Failed(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +78,26 @@ pub fn service_enabled(settings: &AppSettings, portable: bool) -> bool {
     disabled_reason(settings, portable).is_none()
 }
 
-pub fn next_step(downloaded: bool, check_failed: bool, idle: Duration, gate_free: bool) -> Step {
+pub fn next_step(
+    downloaded: bool,
+    check_failed: bool,
+    idle: Duration,
+    gate_free: bool,
+    elapsed: Duration,
+) -> Step {
     if check_failed || !downloaded {
         Step::WaitInterval
     } else if idle >= REQUIRED_IDLE && gate_free {
         Step::Install
+    } else if elapsed >= CHECK_INTERVAL {
+        Step::Recheck
     } else {
         Step::PollIdle
     }
+}
+
+pub fn delay_before_next_check(cycle_elapsed: Duration) -> Duration {
+    CHECK_INTERVAL.saturating_sub(cycle_elapsed)
 }
 
 #[cfg(windows)]
@@ -238,7 +264,10 @@ pub fn spawn_background(app: &AppHandle) {
             );
             thread::sleep(STARTUP_DELAY);
             loop {
-                if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| run_cycle(&app))) {
+                let started = Instant::now();
+                if let Err(payload) =
+                    panic::catch_unwind(AssertUnwindSafe(|| run_cycle(&app, started)))
+                {
                     let reason = payload
                         .downcast_ref::<&str>()
                         .copied()
@@ -248,8 +277,9 @@ pub fn spawn_background(app: &AppHandle) {
                         "fork updater: update cycle panicked ({reason}); the service keeps running"
                     );
                 }
-                log::info!("fork updater: next check in {}s", CHECK_INTERVAL.as_secs());
-                thread::sleep(CHECK_INTERVAL);
+                let delay = delay_before_next_check(started.elapsed());
+                log::info!("fork updater: next check in {}s", delay.as_secs());
+                thread::sleep(delay);
             }
         });
     if let Err(e) = spawned {
@@ -257,7 +287,7 @@ pub fn spawn_background(app: &AppHandle) {
     }
 }
 
-fn run_cycle(app: &AppHandle) {
+fn run_cycle(app: &AppHandle, started: Instant) {
     if let Some(reason) = current_disabled_reason(app) {
         log::info!("fork updater: service disabled ({reason:?})");
         return;
@@ -295,8 +325,21 @@ fn run_cycle(app: &AppHandle) {
         }
         let idle = input_idle();
         let gate_free = gate.is_free();
-        match next_step(pending.is_some(), check_failed, idle, gate_free) {
+        match next_step(
+            pending.is_some(),
+            check_failed,
+            idle,
+            gate_free,
+            started.elapsed(),
+        ) {
             Step::WaitInterval => return,
+            Step::Recheck => {
+                log::info!(
+                    "fork updater: no install window (input idle and dictation idle) within {}s; dropping the download to check again",
+                    CHECK_INTERVAL.as_secs()
+                );
+                return;
+            }
             Step::PollIdle => {
                 let wait = (idle >= REQUIRED_IDLE, gate_free);
                 if last_wait != Some(wait) {
@@ -310,7 +353,16 @@ fn run_cycle(app: &AppHandle) {
             }
             Step::Install => {
                 if let Some((update, bytes)) = &pending {
-                    try_install(app, &gate, update, bytes);
+                    let attempt = try_install(&gate, &update.version, input_idle, || {
+                        flush_then_install(app, update, bytes)?;
+                        app.restart()
+                    });
+                    if let Attempt::Failed(e) = &attempt {
+                        log::warn!("fork updater: {e}; dropping the download until the next check");
+                    }
+                    if attempt.ends_cycle() {
+                        return;
+                    }
                 }
                 last_wait = None;
             }
@@ -319,33 +371,33 @@ fn run_cycle(app: &AppHandle) {
     }
 }
 
-fn try_install(app: &AppHandle, gate: &Arc<ActivityGate>, update: &Update, bytes: &[u8]) {
+fn try_install(
+    gate: &Arc<ActivityGate>,
+    version: &str,
+    idle_now: impl FnOnce() -> Duration,
+    install: impl FnOnce() -> Result<Infallible, String>,
+) -> Attempt {
     let Some(guard) = gate.try_begin_install() else {
         log::info!("fork updater: dictation started before install; polling again");
-        return;
+        return Attempt::Deferred;
     };
-    let idle = input_idle();
+    let idle = idle_now();
     if idle < REQUIRED_IDLE {
         drop(guard);
         log::info!(
             "fork updater: input {}s ago, before install; polling again",
             idle.as_secs()
         );
-        return;
+        return Attempt::Deferred;
     }
 
     log::info!(
-        "fork updater: installing {} after {}s idle; Handy restarts hidden",
-        update.version,
+        "fork updater: installing {version} after {}s idle; Handy restarts hidden",
         idle.as_secs()
     );
-    match flush_then_install(app, update, bytes) {
-        Ok(()) => app.restart(),
-        Err(e) => {
-            drop(guard);
-            log::warn!("fork updater: {e}; polling again");
-        }
-    }
+    let Err(e) = install();
+    drop(guard);
+    Attempt::Failed(e)
 }
 
 #[cfg(test)]
@@ -412,7 +464,8 @@ mod tests {
         assert_eq!(report(&fork_endpoints, FORK_PUBKEY)["ok"], true);
 
         let upstream = vec![
-            "https://github.com/someone-else/Handy/releases/latest/download/latest.json".to_string(),
+            "https://github.com/someone-else/Handy/releases/latest/download/latest.json"
+                .to_string(),
         ];
         assert_eq!(report(&upstream, FORK_PUBKEY)["ok"], false);
 
@@ -426,42 +479,144 @@ mod tests {
 
     const IDLE_ENOUGH: Duration = REQUIRED_IDLE;
     const NOT_IDLE: Duration = Duration::from_secs(599);
+    const JUST_STARTED: Duration = Duration::ZERO;
+    const NEARLY_DUE: Duration = Duration::from_secs(4 * 3600 - 1);
 
     #[test]
     fn next_step_on_check_error_waits() {
         for downloaded in [false, true] {
             for gate_free in [false, true] {
                 for idle in [Duration::ZERO, NOT_IDLE, IDLE_ENOUGH, CHECK_INTERVAL] {
-                    assert_eq!(
-                        next_step(downloaded, true, idle, gate_free),
-                        Step::WaitInterval,
-                        "downloaded={downloaded} gate_free={gate_free} idle={idle:?}"
-                    );
+                    for elapsed in [JUST_STARTED, NEARLY_DUE, CHECK_INTERVAL] {
+                        assert_eq!(
+                            next_step(downloaded, true, idle, gate_free, elapsed),
+                            Step::WaitInterval,
+                            "downloaded={downloaded} gate_free={gate_free} idle={idle:?} elapsed={elapsed:?}"
+                        );
+                    }
                 }
             }
         }
-        assert_eq!(
-            next_step(false, false, IDLE_ENOUGH, true),
-            Step::WaitInterval
-        );
+        for elapsed in [JUST_STARTED, CHECK_INTERVAL] {
+            assert_eq!(
+                next_step(false, false, IDLE_ENOUGH, true, elapsed),
+                Step::WaitInterval
+            );
+        }
     }
 
     #[test]
     fn next_step_waits_for_ten_minutes_idle() {
         assert_eq!(REQUIRED_IDLE, Duration::from_secs(600));
-        assert_eq!(next_step(true, false, Duration::ZERO, true), Step::PollIdle);
-        assert_eq!(next_step(true, false, NOT_IDLE, true), Step::PollIdle);
-        assert_eq!(next_step(true, false, IDLE_ENOUGH, true), Step::Install);
-        assert_eq!(next_step(true, false, CHECK_INTERVAL, true), Step::Install);
+        assert_eq!(
+            next_step(true, false, Duration::ZERO, true, JUST_STARTED),
+            Step::PollIdle
+        );
+        assert_eq!(
+            next_step(true, false, NOT_IDLE, true, JUST_STARTED),
+            Step::PollIdle
+        );
+        assert_eq!(
+            next_step(true, false, IDLE_ENOUGH, true, JUST_STARTED),
+            Step::Install
+        );
+        assert_eq!(
+            next_step(true, false, CHECK_INTERVAL, true, JUST_STARTED),
+            Step::Install
+        );
     }
 
     #[test]
     fn next_step_polls_when_gate_busy_even_if_idle() {
-        assert_eq!(next_step(true, false, IDLE_ENOUGH, false), Step::PollIdle);
         assert_eq!(
-            next_step(true, false, CHECK_INTERVAL, false),
+            next_step(true, false, IDLE_ENOUGH, false, JUST_STARTED),
             Step::PollIdle
         );
+        assert_eq!(
+            next_step(true, false, CHECK_INTERVAL, false, JUST_STARTED),
+            Step::PollIdle
+        );
+    }
+
+    #[test]
+    fn next_step_rechecks_once_check_interval_spent_polling() {
+        assert_eq!(CHECK_INTERVAL, Duration::from_secs(4 * 3600));
+        assert_eq!(
+            next_step(true, false, NOT_IDLE, true, NEARLY_DUE),
+            Step::PollIdle
+        );
+        assert_eq!(
+            next_step(true, false, NOT_IDLE, true, CHECK_INTERVAL),
+            Step::Recheck
+        );
+        assert_eq!(
+            next_step(true, false, IDLE_ENOUGH, false, CHECK_INTERVAL),
+            Step::Recheck
+        );
+        assert_eq!(
+            next_step(true, false, NOT_IDLE, true, CHECK_INTERVAL * 2),
+            Step::Recheck
+        );
+    }
+
+    #[test]
+    fn next_step_installs_rather_than_rechecks_when_ready() {
+        assert_eq!(
+            next_step(true, false, IDLE_ENOUGH, true, CHECK_INTERVAL),
+            Step::Install
+        );
+    }
+
+    #[test]
+    fn next_check_is_one_interval_after_the_cycle_started() {
+        assert_eq!(delay_before_next_check(Duration::ZERO), CHECK_INTERVAL);
+        assert_eq!(
+            delay_before_next_check(Duration::from_secs(3600)),
+            Duration::from_secs(3 * 3600)
+        );
+        assert_eq!(delay_before_next_check(CHECK_INTERVAL), Duration::ZERO);
+        assert_eq!(delay_before_next_check(CHECK_INTERVAL * 2), Duration::ZERO);
+    }
+
+    fn install_must_not_run() -> Result<Infallible, String> {
+        panic!("install ran when it should have been deferred")
+    }
+
+    #[test]
+    fn install_error_ends_the_cycle_and_frees_the_gate() {
+        let gate = ActivityGate::new();
+        let attempt = try_install(
+            &gate,
+            "0.9.8-jw.2",
+            || IDLE_ENOUGH,
+            || Err("Update install failed: boom".to_string()),
+        );
+        assert_eq!(
+            attempt,
+            Attempt::Failed("Update install failed: boom".to_string())
+        );
+        assert!(attempt.ends_cycle());
+        assert!(gate.is_free());
+    }
+
+    #[test]
+    fn busy_gate_defers_install_and_keeps_polling() {
+        let gate = ActivityGate::new();
+        let permit = gate.try_acquire().unwrap();
+        let attempt = try_install(&gate, "0.9.8-jw.2", || IDLE_ENOUGH, install_must_not_run);
+        assert_eq!(attempt, Attempt::Deferred);
+        assert!(!attempt.ends_cycle());
+        drop(permit);
+        assert!(gate.is_free());
+    }
+
+    #[test]
+    fn input_before_install_defers_and_keeps_polling() {
+        let gate = ActivityGate::new();
+        let attempt = try_install(&gate, "0.9.8-jw.2", || NOT_IDLE, install_must_not_run);
+        assert_eq!(attempt, Attempt::Deferred);
+        assert!(!attempt.ends_cycle());
+        assert!(gate.is_free());
     }
 
     const SERVICE_CHILD_ENV: &str = "HANDY_FORK_UPDATER_TEST_CHILD";
