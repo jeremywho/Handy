@@ -1,4 +1,5 @@
 mod actions;
+pub mod activity_gate;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod apple_intelligence;
 mod audio_feedback;
@@ -942,6 +943,7 @@ pub fn run(cli_args: CliArgs) {
             Some(vec![]),
         ))
         .manage(cli_args.clone())
+        .manage(activity_gate::ActivityGate::new())
         .setup(move |app| {
             #[cfg(target_os = "windows")]
             log::info!(
