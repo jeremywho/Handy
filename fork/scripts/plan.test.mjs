@@ -8,6 +8,7 @@ import {
   rebaseChecks,
   fetchWithRetry,
   formatOutputs,
+  githubClient,
   parseWorkflowChanges,
   uniqueTags,
 } from "./plan.mjs";
@@ -20,6 +21,7 @@ const STOP_REASONS = {
   "new-upstream-adds-workflow": /new-thing\.yml/,
   "new-upstream-touches-fork-release": /fork-release\.yml/,
   "tag-version-mismatch": /0\.9\.9-rc1/,
+  "upstream-regressed-below-base": /v0\.9\.7.*v0\.9\.8/,
   retagged: /v0\.9\.8/,
   "stale-draft-plus-new-upstream": /stale draft.*301.*v0\.9\.9-jw\.1/,
   "draft-without-provenance": /stale draft.*305/,
@@ -74,6 +76,10 @@ const RULE_FIXTURES = [
   ["rule 7: a push to jw builds the next N", "jw-push"],
   ["rule 7: the first release builds jw.1", "first-release"],
   ["rule 8: nothing changed is a no-op", "noop"],
+  [
+    "an upstream latest older than the base stops",
+    "upstream-regressed-below-base",
+  ],
 ];
 
 for (const [title, name] of RULE_FIXTURES) {
@@ -214,8 +220,8 @@ test("upstream newer compares numerically, not as strings", () => {
   });
 });
 
-test("an upstream latest older than the base is not a rebase", () => {
-  const { state } = loadFixture("noop");
+test("an upstream regression below the base stops before resuming a draft", () => {
+  const { state } = loadFixture("draft-matching-head");
   const decision = decide({
     ...state,
     upstreamLatest: {
@@ -224,7 +230,7 @@ test("an upstream latest older than the base is not a rebase", () => {
       confVersion: "0.9.7",
     },
   });
-  assert.deepEqual(decision, { action: "noop" });
+  assert.equal(decision.action, "stop");
 });
 
 test("rebaseChecks passes a clean rebase", () =>
@@ -471,4 +477,73 @@ test("fetchWithRetry fails at once on other client errors", async () => {
     /401/,
   );
   assert.equal(calls.length, 1);
+});
+
+function routedFetch(route) {
+  const calls = [];
+  const fetch = async (url) => {
+    calls.push(url);
+    const { body, headers = {} } = route(new URL(url));
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json", ...headers },
+    });
+  };
+  return { fetch, calls };
+}
+
+const noSleep = async () => {};
+
+test("matchingRefs makes one call even though the endpoint ignores paging", async () => {
+  const refs = Array.from({ length: 150 }, (_, i) => ({
+    ref: `refs/tags/v0.${i}.0`,
+  }));
+  const { fetch, calls } = routedFetch(() => ({ body: refs }));
+  const github = githubClient({ fetch, sleep: noSleep });
+  const result = await github.matchingRefs("jeremywho/Handy", "tags/v");
+  assert.equal(result.length, 150);
+  assert.equal(calls.length, 1);
+  assert.match(
+    calls[0],
+    /\/repos\/jeremywho\/Handy\/git\/matching-refs\/tags\/v$/,
+  );
+});
+
+test("apiList follows rel=next and stops when there is no next link", async () => {
+  const page = (n) =>
+    Array.from({ length: 100 }, (_, i) => ({ id: n * 1000 + i }));
+  const { fetch, calls } = routedFetch((url) => {
+    const n = Number(url.searchParams.get("page") ?? "1");
+    if (n === 1) {
+      return {
+        body: page(1),
+        headers: {
+          link: '<https://api.github.com/repos/jeremywho/Handy/releases?per_page=100&page=2>; rel="next", <https://api.github.com/repos/jeremywho/Handy/releases?per_page=100&page=2>; rel="last"',
+        },
+      };
+    }
+    return { body: page(2) };
+  });
+  const github = githubClient({ fetch, sleep: noSleep });
+  const items = await github.apiList("/repos/jeremywho/Handy/releases");
+  assert.equal(items.length, 200);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    calls.map((url) => new URL(url).searchParams.get("page")),
+    [null, "2"],
+  );
+});
+
+test("apiList stops when a page repeats the previous page", async () => {
+  const same = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+  const { fetch, calls } = routedFetch((url) => ({
+    body: same,
+    headers: {
+      link: `<https://api.github.com/repos/x/y/releases?per_page=100&page=${Number(url.searchParams.get("page") ?? "1") + 1}>; rel="next"`,
+    },
+  }));
+  const github = githubClient({ fetch, sleep: noSleep });
+  const items = await github.apiList("/repos/x/y/releases");
+  assert.equal(items.length, 100);
+  assert.equal(calls.length, 2);
 });

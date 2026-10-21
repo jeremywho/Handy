@@ -79,6 +79,11 @@ export function decide(state) {
   if (!upstreamVersion) {
     return stop(`upstream latest tag ${upstreamLatest.tag} is not vX.Y.Z`);
   }
+  if (compareVersions(upstreamVersion, baseVersion) < 0) {
+    return stop(
+      `upstream latest ${upstreamLatest.tag} is older than the base ${base.tag}`,
+    );
+  }
 
   if (drafts.length > 0) {
     const stale = drafts.filter(
@@ -260,7 +265,17 @@ export async function fetchWithRetry(
   );
 }
 
-function githubClient({ token, fetch, sleep }) {
+const MAX_PAGES = 50;
+
+function nextLink(header) {
+  for (const part of (header ?? "").split(",")) {
+    const match = /<([^>]+)>\s*;\s*rel="next"/.exec(part);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+export function githubClient({ token, fetch, sleep }) {
   const apiHeaders = {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -276,17 +291,30 @@ function githubClient({ token, fetch, sleep }) {
       const res = await get(`https://api.github.com${pathname}`, apiHeaders);
       return res && res.json();
     },
-    async apiPages(pathname) {
+    async apiList(pathname) {
+      const sep = pathname.includes("?") ? "&" : "?";
+      let url = `https://api.github.com${pathname}${sep}per_page=100`;
       const items = [];
-      for (let page = 1; ; page++) {
-        const sep = pathname.includes("?") ? "&" : "?";
-        const batch = await this.api(
-          `${pathname}${sep}per_page=100&page=${page}`,
-        );
-        if (!batch) return items;
+      let previousFirst;
+      for (let page = 1; url; page++) {
+        if (page > MAX_PAGES) {
+          throw new Error(`${pathname}: more than ${MAX_PAGES} pages`);
+        }
+        const res = await get(url, apiHeaders);
+        if (!res) return items;
+        const batch = await res.json();
+        const first = JSON.stringify(batch[0]);
+        if (batch.length === 0 || first === previousFirst) return items;
         items.push(...batch);
-        if (batch.length < 100) return items;
+        previousFirst = first;
+        url = nextLink(res.headers.get("link"));
       }
+      return items;
+    },
+    async matchingRefs(repo, prefix) {
+      return (
+        (await this.api(`/repos/${repo}/git/matching-refs/${prefix}`)) ?? []
+      );
     },
     async assetText(repo, assetId) {
       const res = await get(
@@ -372,9 +400,7 @@ async function draftReleases(github, releases) {
 }
 
 async function forkTagNames(github, releases) {
-  const refs = await github.apiPages(
-    `/repos/${FORK_REPO}/git/matching-refs/tags/v`,
-  );
+  const refs = await github.matchingRefs(FORK_REPO, "tags/v");
   return uniqueTags([
     ...refs.map((ref) => ref.ref.replace(/^refs\/tags\//, "")),
     ...releases.map((release) => release.tag_name),
@@ -422,7 +448,7 @@ export async function gatherState({ repoRoot, token, fetch, sleep }) {
     git("show", `${upstreamRef}:src-tauri/tauri.conf.json`),
   ).version;
 
-  const releases = await github.apiPages(`/repos/${FORK_REPO}/releases`);
+  const releases = await github.apiList(`/repos/${FORK_REPO}/releases`);
 
   return {
     base: { tag: base.tag, sha: base.sha },
