@@ -1,0 +1,29 @@
+{
+  "state": {
+    "base": {
+      "tag": "v0.9.8",
+      "sha": "14f6f0d31cb22a4268acfbddba3052820fd0a06e"
+    },
+    "upstreamLatest": {
+      "tag": "v0.9.9",
+      "sha": "9999999999999999999999999999999999999991",
+      "confVersion": "0.9.9"
+    },
+    "jwHead": "1111111111111111111111111111111111111111",
+    "latestPublished": {
+      "version": "0.9.8-jw.2",
+      "sourceSha": "1111111111111111111111111111111111111111"
+    },
+    "publicManifestVersion": "0.9.8-jw.2",
+    "drafts": [],
+    "forkTags": ["v0.9.8-jw.1", "v0.9.8-jw.2"],
+    "upstreamWorkflowChanges": {
+      "added": [],
+      "touchesForkRelease": false
+    },
+    "retagged": true
+  },
+  "expected": {
+    "action": "stop"
+  }
+}
