@@ -208,7 +208,7 @@ other than docs contains `cjpais/Handy/releases`.
 
 ### Workflow `fork-release.yml`
 
-- **Triggers:** a schedule every 6 hours, `workflow_dispatch`, and `push` to
+- **Triggers:** a daily schedule (09:17 UTC), `workflow_dispatch`, and `push` to
   `jw`.
 - **Concurrency:** one group, `cancel-in-progress: false`, so runs never
   overlap and a publish is never cut off partway.

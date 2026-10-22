@@ -26,7 +26,7 @@
   - Unchanged: `identifier` `com.pais.handy`, `productName` `Handy`, NSIS publisher `pais`.
   - Uninstall key: `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Handy`.
 - Schedules:
-  - The upstream check runs every 6 hours.
+  - The upstream check runs daily at 09:17 UTC.
   - The app checks at startup, then every 4 hours.
   - An automatic install waits for 10 minutes without input, and Handy restarts hidden (`--start-hidden`).
 - Secrets:
@@ -418,7 +418,7 @@
 - Consumes Tasks 2, 3 and 8 scripts by path. The decision JSON's fields become job outputs.
 
 The workflow:
-- **Triggers:** `schedule: cron '17 */6 * * *'`, `workflow_dispatch`, `push: branches: [jw]`.
+- **Triggers:** `schedule: cron '17 9 * * *'` (daily), `workflow_dispatch`, `push: branches: [jw]`.
 - **Concurrency:** `group: fork-release`, `cancel-in-progress: false`.
 - **Jobs:**
   1. **`admin`** (ubuntu, `actions: write`):
